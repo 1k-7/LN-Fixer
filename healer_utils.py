@@ -11,8 +11,16 @@ DB_FILE = "data/tocs.sqlite"
 
 def init_db():
     os.makedirs("data", exist_ok=True)
-    conn = sqlite3.connect(DB_FILE)
+    # 30s timeout prevents 'database is locked' errors during extreme concurrency
+    conn = sqlite3.connect(DB_FILE, timeout=30.0) 
     c = conn.cursor()
+    
+    # --- HARDWARE MAXIMIZATION PRAGMAS ---
+    c.execute('PRAGMA journal_mode = WAL;')        # Non-blocking concurrent writes
+    c.execute('PRAGMA synchronous = OFF;')         # Don't wait for OS to write to disk
+    c.execute('PRAGMA cache_size = -1000000;')     # Give SQLite 1GB of pure RAM for caching
+    c.execute('PRAGMA temp_store = MEMORY;')       # Keep temporary operations strictly in RAM
+    
     c.execute('''CREATE TABLE IF NOT EXISTS novels (url TEXT PRIMARY KEY, title TEXT)''')
     c.execute('''CREATE TABLE IF NOT EXISTS chapters (id TEXT, novel_url TEXT, chapter_index INTEGER)''')
     conn.commit()

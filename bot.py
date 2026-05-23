@@ -4,6 +4,8 @@ import asyncio
 import logging
 import shutil
 import multiprocessing
+import concurrent.futures
+import gc
 from concurrent.futures import ProcessPoolExecutor
 
 from telegram import Update
@@ -33,7 +35,7 @@ class HealerBot:
         self.user_states = {}
 
     async def post_init(self, application: Application):
-        # Initialize executor safely inside the async loop
+        # Initialize executor safely inside the async loop for CPU bound tasks (3 of 4 cores)
         self.executor = ProcessPoolExecutor(max_workers=3)
         
         # Start Pyrogram Userbot in the background
@@ -61,7 +63,7 @@ class HealerBot:
 
     async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
-            "🛠 **LN EPUB Healer Ready** (PTB Interface)\n\n"
+            "🛠 **LN EPUB Healer Ready** (Hybrid Architecture)\n\n"
             "1. Send me your URLs JSON file and reply to it with `/builddb` to build the TOC database.\n"
             "2. Once built, send `/heal` to start the channel processing."
         )
@@ -83,25 +85,61 @@ class HealerBot:
         conn = init_db()
         c = conn.cursor()
 
-        await status_msg.edit_text(f"⚙️ Building DB for {len(urls)} URLs. This will run in the background.")
+        await status_msg.edit_text("⚙️ Filtering out existing URLs from the database...")
+
+        # Fast pre-filter
+        urls_to_process = []
+        for url in urls:
+            c.execute("SELECT 1 FROM novels WHERE url=?", (url,))
+            if not c.fetchone():
+                urls_to_process.append(url)
+
+        total = len(urls_to_process)
+        if total == 0:
+            conn.close()
+            return await status_msg.edit_text("✅ All URLs are already in the database! Send `/heal` to begin processing.")
+
+        # --- HARDWARE MAXIMIZATION SETTINGS ---
+        MAX_WORKERS = 500 
+        CHUNK_SIZE = 1000 
+        
+        await status_msg.edit_text(f"🚀 Pushing Hardware to Limit: {MAX_WORKERS} Threads | {CHUNK_SIZE} Chunks...")
 
         loop = asyncio.get_running_loop()
         success_count = 0
-
-        for i, url in enumerate(urls):
-            c.execute("SELECT 1 FROM novels WHERE url=?", (url,))
-            if c.fetchone(): continue
-
-            if i % 10 == 0:
-                await status_msg.edit_text(f"⚙️ DB Build Progress: {i}/{len(urls)}")
-
-            result = await loop.run_in_executor(self.executor, scrape_toc_worker, url)
-
-            if not result.get("error"):
-                c.execute("INSERT INTO novels (url, title) VALUES (?, ?)", (url, result["title"]))
-                c.executemany("INSERT INTO chapters (id, novel_url, chapter_index) VALUES (?, ?, ?)", result["chapters"])
-                conn.commit()
-                success_count += 1
+        
+        with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+            for i in range(0, total, CHUNK_SIZE):
+                chunk = urls_to_process[i:i+CHUNK_SIZE]
+                
+                # Fire the whole chunk simultaneously
+                tasks = [loop.run_in_executor(pool, scrape_toc_worker, url) for url in chunk]
+                results = await asyncio.gather(*tasks)
+                
+                novel_data = []
+                chapter_data = []
+                
+                for res in results:
+                    if not res.get("error"):
+                        novel_data.append((res["url"], res["title"]))
+                        chapter_data.extend(res["chapters"])
+                        success_count += 1
+                        
+                # Bulk execute massive inserts
+                if novel_data:
+                    c.executemany("INSERT INTO novels (url, title) VALUES (?, ?)", novel_data)
+                    c.executemany("INSERT INTO chapters (id, novel_url, chapter_index) VALUES (?, ?, ?)", chapter_data)
+                    conn.commit()
+                    
+                await status_msg.edit_text(f"🔥 OVERDRIVE: {min(i+CHUNK_SIZE, total)}/{total} URLs Scraped ({success_count} successful)")
+                
+                # Force RAM Wipe
+                del results
+                del novel_data
+                del chapter_data
+                gc.collect() 
+                
+                await asyncio.sleep(0.5) 
 
         conn.close()
         await status_msg.edit_text(f"✅ DB Build Complete! Scraped {success_count} new TOCs.\nSend `/heal` to begin processing.")
@@ -214,7 +252,7 @@ class HealerBot:
                         os.remove(epub_path)
 
     def start(self):
-        print("🚀 Bot Starting (PTB Interface)...")
+        print("🚀 Bot Starting (Hybrid Architecture)...")
         app = Application.builder().token(TOKEN).post_init(self.post_init).post_stop(self.post_stop).build()
 
         app.add_handler(CommandHandler("start", self.cmd_start))
