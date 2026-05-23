@@ -36,10 +36,10 @@ def get_db_toc_count(url):
 
 def scrape_toc_worker(url):
     """Fetches ONLY the TOC (no chapter bodies) and returns it for DB insertion."""
-    load_sources()
     app = App()
     try:
         app.user_input = url
+        # load_sources() intentionally removed from here to prevent Thread crashes
         app.prepare_search()
         app.get_novel_info()
         
@@ -137,6 +137,7 @@ def analyze_and_fix_epub(epub_path):
 
 def redownload_worker(url, out_dir):
     """Triggers a clean lncrawl download programmatically"""
+    # Requires load_sources because it runs in an isolated ProcessPool container
     load_sources()
     app = App()
     try:

@@ -10,8 +10,11 @@ from concurrent.futures import ProcessPoolExecutor
 
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+from telegram.error import RetryAfter
 from pyrogram import Client as UserBotClient
 
+# Explicitly load lncrawl sources globally for the threads
+from lncrawl.core.sources import load_sources 
 from healer_utils import init_db, scrape_toc_worker, analyze_and_fix_epub, redownload_worker, DB_FILE
 
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
@@ -63,7 +66,7 @@ class HealerBot:
 
     async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
-            "🛠 **LN EPUB Healer Ready** (Hybrid Architecture)\n\n"
+            "🛠 **LN EPUB Healer Ready** (Queue Architecture)\n\n"
             "1. Send me your URLs JSON file and reply to it with `/builddb` to build the TOC database.\n"
             "2. Once built, send `/heal` to start the channel processing."
         )
@@ -87,7 +90,6 @@ class HealerBot:
 
         await status_msg.edit_text("⚙️ Filtering out existing URLs from the database...")
 
-        # Fast pre-filter
         urls_to_process = []
         for url in urls:
             c.execute("SELECT 1 FROM novels WHERE url=?", (url,))
@@ -99,49 +101,96 @@ class HealerBot:
             conn.close()
             return await status_msg.edit_text("✅ All URLs are already in the database! Send `/heal` to begin processing.")
 
-        # --- HARDWARE MAXIMIZATION SETTINGS ---
-        MAX_WORKERS = 500 
-        CHUNK_SIZE = 1000 
-        
-        await status_msg.edit_text(f"🚀 Pushing Hardware to Limit: {MAX_WORKERS} Threads | {CHUNK_SIZE} Chunks...")
-
         loop = asyncio.get_running_loop()
-        success_count = 0
-        
-        with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-            for i in range(0, total, CHUNK_SIZE):
-                chunk = urls_to_process[i:i+CHUNK_SIZE]
-                
-                # Fire the whole chunk simultaneously
-                tasks = [loop.run_in_executor(pool, scrape_toc_worker, url) for url in chunk]
-                results = await asyncio.gather(*tasks)
-                
-                novel_data = []
-                chapter_data = []
-                
-                for res in results:
-                    if not res.get("error"):
-                        novel_data.append((res["url"], res["title"]))
-                        chapter_data.extend(res["chapters"])
-                        success_count += 1
-                        
-                # Bulk execute massive inserts
-                if novel_data:
-                    c.executemany("INSERT INTO novels (url, title) VALUES (?, ?)", novel_data)
-                    c.executemany("INSERT INTO chapters (id, novel_url, chapter_index) VALUES (?, ?, ?)", chapter_data)
-                    conn.commit()
-                    
-                await status_msg.edit_text(f"🔥 OVERDRIVE: {min(i+CHUNK_SIZE, total)}/{total} URLs Scraped ({success_count} successful)")
-                
-                # Force RAM Wipe
-                del results
-                del novel_data
-                del chapter_data
-                gc.collect() 
-                
-                await asyncio.sleep(0.5) 
 
+        # LOAD ONCE GLOBALLY TO PREVENT CORRUPTION
+        await status_msg.edit_text("⚙️ Booting lncrawl core architecture...")
+        await loop.run_in_executor(None, load_sources)
+
+        # Let's drop this to 50 temporarily just to see if Cloudflare is the issue
+        MAX_WORKERS = 50 
+        await status_msg.edit_text(f"🚀 Spooling up continuous Queue System with {MAX_WORKERS} concurrent workers...")
+        
+        # Load the Queue
+        queue = asyncio.Queue()
+        for u in urls_to_process:
+            queue.put_nowait(u)
+
+        # State Variables
+        success_count = 0
+        processed_count = 0
+        novel_data_batch = []
+        chapter_data_batch = []
+        is_running = True
+        db_lock = asyncio.Lock()
+
+        # --- THE WORKER TASK ---
+        async def scraper_worker(pool):
+            nonlocal success_count, processed_count
+            while not queue.empty():
+                url = queue.get_nowait()
+                try:
+                    # Strict 30s timeout per URL so hanging sites NEVER stall the queue
+                    res = await asyncio.wait_for(
+                        loop.run_in_executor(pool, scrape_toc_worker, url), 
+                        timeout=30.0 
+                    )
+                except asyncio.TimeoutError:
+                    res = {"url": url, "error": "Timeout"}
+                except Exception as e:
+                    res = {"url": url, "error": str(e)}
+
+                # Safely log results to the shared batch arrays
+                async with db_lock:
+                    processed_count += 1
+                    if not res.get("error"):
+                        novel_data_batch.append((res["url"], res.get("title", "Unknown")))
+                        chapter_data_batch.extend(res.get("chapters", []))
+                        success_count += 1
+                    else:
+                        # LOG THE SPECIFIC FAILURE SO WE CAN SEE IF IT'S CLOUDFLARE
+                        logger.error(f"❌ Scrape Failed for {url}: {res.get('error')}")
+
+                queue.task_done()
+
+        # --- THE UI/DB FLUSHER TASK ---
+        async def ui_db_flusher():
+            last_processed = -1
+            while is_running or novel_data_batch:
+                await asyncio.sleep(4) # Run exactly every 4 seconds to bypass Telegram flood limits
+                
+                async with db_lock:
+                    if novel_data_batch:
+                        # Massive bulk insert in a fraction of a second
+                        c.executemany("INSERT INTO novels (url, title) VALUES (?, ?)", novel_data_batch)
+                        c.executemany("INSERT INTO chapters (id, novel_url, chapter_index) VALUES (?, ?, ?)", chapter_data_batch)
+                        conn.commit()
+                        novel_data_batch.clear()
+                        chapter_data_batch.clear()
+                        
+                if processed_count > last_processed:
+                    try:
+                        await status_msg.edit_text(f"🔥 Progress: {processed_count}/{total} URLs Scraped ({success_count} successful)\nWorkers Active: {MAX_WORKERS}")
+                    except RetryAfter as e:
+                        await asyncio.sleep(e.retry_after) # Obey Telegram if we somehow hit limits
+                    except Exception:
+                        pass # Ignore minor network blips
+                    last_processed = processed_count
+                    gc.collect() # Force RAM wipe every 4 seconds
+
+        # Launch the Flusher
+        flusher_task = asyncio.create_task(ui_db_flusher())
+        
+        # Launch the Workers in the ThreadPool
+        with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+            workers = [asyncio.create_task(scraper_worker(pool)) for _ in range(MAX_WORKERS)]
+            await asyncio.gather(*workers)
+            
+        # Cleanup
+        is_running = False
+        await flusher_task # Wait for final DB flush to complete
         conn.close()
+        
         await status_msg.edit_text(f"✅ DB Build Complete! Scraped {success_count} new TOCs.\nSend `/heal` to begin processing.")
 
     async def cmd_heal(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -252,7 +301,7 @@ class HealerBot:
                         os.remove(epub_path)
 
     def start(self):
-        print("🚀 Bot Starting (Hybrid Architecture)...")
+        print("🚀 Bot Starting (Queue Architecture)...")
         app = Application.builder().token(TOKEN).post_init(self.post_init).post_stop(self.post_stop).build()
 
         app.add_handler(CommandHandler("start", self.cmd_start))
