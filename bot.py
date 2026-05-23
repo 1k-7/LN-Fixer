@@ -2,10 +2,11 @@ import os
 import json
 import asyncio
 import logging
-from pyrogram import Client, filters
+from pyrogram import Client, filters, idle
 from pyrogram.types import Message
 from concurrent.futures import ProcessPoolExecutor
 import multiprocessing
+import shutil
 
 from healer_utils import init_db, scrape_toc_worker, analyze_and_fix_epub, redownload_worker, DB_FILE
 
@@ -15,8 +16,11 @@ logger = logging.getLogger(__name__)
 API_ID = int(os.getenv("API_ID", 123456))
 API_HASH = os.getenv("API_HASH", "")
 BOT_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
+SESSION_STRING = os.getenv("SESSION_STRING", "")
 
 app = Client("healer_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+userbot = Client("healer_userbot", api_id=API_ID, api_hash=API_HASH, session_string=SESSION_STRING, in_memory=True) if SESSION_STRING else None
+
 executor = ProcessPoolExecutor(max_workers=5)
 user_states = {}
 
@@ -24,6 +28,18 @@ DATA_DIR = "data"
 TEMP_DIR = "temp_epubs"
 os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(TEMP_DIR, exist_ok=True)
+
+# Helper function to route uploads based on file size
+async def safe_upload(client, chat_id, file_path, caption):
+    file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
+    if file_size_mb > 49.5:
+        if userbot:
+            logger.info(f"File {file_size_mb:.1f}MB > 50MB. Delegating to Userbot.")
+            await userbot.send_document(chat_id, document=file_path, caption=caption + "\n(Uploaded via Userbot)")
+        else:
+            await client.send_message(chat_id, f"❌ Failed to upload. File is {file_size_mb:.1f}MB and no Userbot session is configured.")
+    else:
+        await client.send_document(chat_id, document=file_path, caption=caption)
 
 @app.on_message(filters.command("start"))
 async def start_cmd(client, message: Message):
@@ -55,7 +71,7 @@ async def builddb_cmd(client, message: Message):
     
     for i, url in enumerate(urls):
         c.execute("SELECT 1 FROM novels WHERE url=?", (url,))
-        if c.fetchone(): continue # Skip existing
+        if c.fetchone(): continue 
             
         if i % 10 == 0:
             await status.edit(f"⚙️ DB Build Progress: {i}/{len(urls)}")
@@ -110,7 +126,6 @@ async def state_machine(client, message: Message):
             state["step"] = "RUNNING"
             await message.reply("🚀 Configuration complete! Starting the Healer Engine...")
             
-            # Start the background task
             asyncio.create_task(run_healing_loop(client, chat_id, state))
             
     except ValueError:
@@ -124,7 +139,6 @@ async def run_healing_loop(client, chat_id, config):
     ok_chat = config["ok_chat"]
     fixed_chat = config["fixed_chat"]
     
-    # Process in chunks of 200 (Telegram Limit)
     for chunk_start in range(config["start_msg"], config["end_msg"] + 1, 200):
         chunk_end = min(chunk_start + 199, config["end_msg"])
         msg_ids = list(range(chunk_start, chunk_end + 1))
@@ -140,15 +154,13 @@ async def run_healing_loop(client, chat_id, config):
             await msg.download(file_name=epub_path)
             
             try:
-                # 1. Analyze and Fix
                 status, result = await loop.run_in_executor(executor, analyze_and_fix_epub, epub_path)
                 
                 if status == "OK":
-                    # Zero-bandwidth forward via file_id
                     await client.send_document(ok_chat, document=msg.document.file_id, caption="Status: OK")
                     
                 elif status == "FIXED":
-                    await client.send_document(fixed_chat, document=result, caption="Status: Fixed Jumbled Spine")
+                    await safe_upload(client, fixed_chat, result, "Status: Fixed Jumbled Spine")
                     os.remove(result)
                     
                 elif status == "MISSING":
@@ -160,7 +172,7 @@ async def run_healing_loop(client, chat_id, config):
                     
                     new_epub = await loop.run_in_executor(executor, redownload_worker, source_url, redownload_dir)
                     if new_epub:
-                        await client.send_document(fixed_chat, document=new_epub, caption="Status: Redownloaded Missing Chapters")
+                        await safe_upload(client, fixed_chat, new_epub, "Status: Redownloaded Missing Chapters")
                     else:
                         await client.send_message(chat_id, f"❌ Failed to redownload Msg {msg.id}.")
                         
@@ -175,7 +187,17 @@ async def run_healing_loop(client, chat_id, config):
                 if os.path.exists(epub_path):
                     os.remove(epub_path)
 
+async def main():
+    await app.start()
+    if userbot:
+        await userbot.start()
+        print("✅ Userbot Connected!")
+    print("🚀 Healer Bot Online!")
+    await idle()
+    await app.stop()
+    if userbot:
+        await userbot.stop()
+
 if __name__ == "__main__":
     multiprocessing.freeze_support()
-    print("🚀 Healer Bot Starting...")
-    app.run()
+    asyncio.run(main())
