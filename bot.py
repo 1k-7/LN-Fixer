@@ -65,7 +65,7 @@ class HealerBot:
 
     async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
-            "🛠 **LN EPUB Healer Ready** (Anti-Zombie Architecture)\n\n"
+            "🛠 **LN EPUB Healer Ready** (Connection Pooling Enabled)\n\n"
             "1. Send me your URLs JSON file and reply to it with `/builddb` to build the TOC database.\n"
             "2. Once built, send `/heal` to start the channel processing."
         )
@@ -105,8 +105,9 @@ class HealerBot:
         await status_msg.edit_text("⚙️ Booting lncrawl core architecture...")
         await loop.run_in_executor(None, load_sources)
 
-        MAX_WORKERS = 20 
-        await status_msg.edit_text(f"🚀 Spooling up Auto-Retry Queue System with {MAX_WORKERS} concurrent workers...")
+        # Connection pooling allows us to safely bump this back up to 150
+        MAX_WORKERS = 150 
+        await status_msg.edit_text(f"🚀 Spooling up Shared Session Pool with {MAX_WORKERS} concurrent workers...")
         
         queue = asyncio.Queue()
         for u in urls_to_process:
@@ -131,7 +132,7 @@ class HealerBot:
                 try:
                     res = await asyncio.wait_for(
                         loop.run_in_executor(pool, scrape_toc_worker, url), 
-                        timeout=25.0 
+                        timeout=35.0 
                     )
                 except asyncio.TimeoutError:
                     res = {"url": url, "error": "Timeout Error"}
@@ -183,10 +184,10 @@ class HealerBot:
                 if processed_count > last_processed or active_retries != last_retries:
                     try:
                         await status_msg.edit_text(
-                            f"🔥 Finalized: {processed_count}/{total}\n"
+                            f"⚡ Pipeline Progress: {processed_count}/{total}\n"
                             f"✅ Success: {success_count} | ❌ Failed: {failed_permanently}\n"
                             f"🔄 Active Retries in Queue: {active_retries}\n"
-                            f"Workers Active: {MAX_WORKERS}"
+                            f"Workers Active: {MAX_WORKERS} (Shared Pool)"
                         )
                     except RetryAfter as e:
                         await asyncio.sleep(e.retry_after) 
@@ -313,7 +314,7 @@ class HealerBot:
                         os.remove(epub_path)
 
     def start(self):
-        print("🚀 Bot Starting (Anti-Zombie Config)...")
+        print("🚀 Bot Starting (Connection Pooling Config)...")
         app = Application.builder().token(TOKEN).post_init(self.post_init).post_stop(self.post_stop).build()
 
         app.add_handler(CommandHandler("start", self.cmd_start))

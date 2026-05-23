@@ -3,23 +3,30 @@ import re
 import sqlite3
 import zipfile
 import shutil
+import requests
+import cloudscraper
 from bs4 import BeautifulSoup
 from lncrawl.core.app import App
 from lncrawl.core.sources import load_sources
 
 # --- THE ZOMBIE THREAD KILLSWITCH ---
-# Cloudscraper/requests will hang forever if a server ignores it. 
-# This forcefully monkey-patches the library to ALWAYS abort after 15 seconds, freeing the thread.
-import requests
 _old_session_request = requests.Session.request
 
 def _new_session_request(self, method, url, **kwargs):
     if kwargs.get('timeout') is None:
-        kwargs['timeout'] = 15.0
+        kwargs['timeout'] = 20.0 # Bumped to 20s to allow initial CF clearance
     return _old_session_request(self, method, url, **kwargs)
 
 requests.Session.request = _new_session_request
-# ------------------------------------
+
+# --- THE SPEED FIX: GLOBAL CONNECTION POOL ---
+# This bypasses Cloudflare ONCE and reuses the open TCP sockets for all workers.
+SHARED_SCRAPER = cloudscraper.create_scraper()
+# Create a massive pipeline capable of holding 200 simultaneous open connections
+adapter = requests.adapters.HTTPAdapter(pool_connections=200, pool_maxsize=200, max_retries=1)
+SHARED_SCRAPER.mount('http://', adapter)
+SHARED_SCRAPER.mount('https://', adapter)
+# ---------------------------------------------
 
 DB_FILE = "data/tocs.sqlite"
 
@@ -47,11 +54,16 @@ def get_db_toc_count(url):
     return count
 
 def scrape_toc_worker(url):
-    """Fetches ONLY the TOC (no chapter bodies) and returns it for DB insertion."""
+    """Fetches ONLY the TOC using the massive shared connection pool."""
     app = App()
     try:
         app.user_input = url
-        app.prepare_search()
+        app.prepare_search() # Initializes app.crawler
+        
+        # INJECT THE SHARED SESSION TO BYPASS SSL/CF OVERHEAD
+        if app.crawler:
+            app.crawler.scraper = SHARED_SCRAPER
+            
         app.get_novel_info()
         
         chapters = []
