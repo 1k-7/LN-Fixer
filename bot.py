@@ -39,10 +39,8 @@ class HealerBot:
         self.user_states = {}
 
     async def post_init(self, application: Application):
-        # Initialize executor safely inside the async loop for CPU bound tasks
         self.executor = ProcessPoolExecutor(max_workers=3)
         
-        # Start Pyrogram Userbot in the background
         if SESSION_STRING and API_ID:
             try:
                 self.userbot = UserBotClient(
@@ -67,7 +65,7 @@ class HealerBot:
 
     async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
-            "🛠 **LN EPUB Healer Ready** (Single-Domain Optimized)\n\n"
+            "🛠 **LN EPUB Healer Ready** (Anti-Zombie Architecture)\n\n"
             "1. Send me your URLs JSON file and reply to it with `/builddb` to build the TOC database.\n"
             "2. Once built, send `/heal` to start the channel processing."
         )
@@ -107,19 +105,18 @@ class HealerBot:
         await status_msg.edit_text("⚙️ Booting lncrawl core architecture...")
         await loop.run_in_executor(None, load_sources)
 
-        # 20 is the absolute physical maximum a single domain will tolerate from 1 IP Address
         MAX_WORKERS = 20 
         await status_msg.edit_text(f"🚀 Spooling up Auto-Retry Queue System with {MAX_WORKERS} concurrent workers...")
         
-        # Load the Queue with retry counters. Format: (url, attempts)
         queue = asyncio.Queue()
         for u in urls_to_process:
             queue.put_nowait((u, 0))
 
-        # State Variables
         success_count = 0
         processed_count = 0
         failed_permanently = 0
+        active_retries = 0
+        
         novel_data_batch = []
         chapter_data_batch = []
         is_running = True
@@ -127,37 +124,41 @@ class HealerBot:
 
         # --- THE WORKER TASK ---
         async def scraper_worker(pool):
-            nonlocal success_count, processed_count, failed_permanently
+            nonlocal success_count, processed_count, failed_permanently, active_retries
             while not queue.empty():
                 url, attempts = queue.get_nowait()
                 
                 try:
                     res = await asyncio.wait_for(
                         loop.run_in_executor(pool, scrape_toc_worker, url), 
-                        timeout=30.0 
+                        timeout=25.0 
                     )
                 except asyncio.TimeoutError:
-                    res = {"url": url, "error": "Timeout"}
+                    res = {"url": url, "error": "Timeout Error"}
                 except Exception as e:
                     res = {"url": url, "error": str(e)}
 
                 if res.get("error"):
                     if attempts < 3:
-                        # AUTO-RETRY: Push back to the end of the queue to try again later
+                        # Mark as retrying
+                        async with db_lock:
+                            active_retries += 1
                         queue.put_nowait((url, attempts + 1))
-                        # Sleep briefly so the worker doesn't instantly hammer the site again
                         await asyncio.sleep(2.0)
                     else:
-                        # Failed 3 times. Mark as permanently dead.
+                        # Permanently failed
                         async with db_lock:
                             processed_count += 1
                             failed_permanently += 1
-                        logger.error(f"❌ DEAD (After 3 Tries): {url} - {res.get('error')}")
+                            active_retries = max(0, active_retries - 1)
+                        logger.error(f"❌ DEAD: {url} - {res.get('error')}")
                 else:
                     # Success
                     async with db_lock:
                         processed_count += 1
                         success_count += 1
+                        if attempts > 0:
+                            active_retries = max(0, active_retries - 1)
                         novel_data_batch.append((res["url"], res.get("title", "Unknown")))
                         chapter_data_batch.extend(res.get("chapters", []))
 
@@ -166,6 +167,7 @@ class HealerBot:
         # --- THE UI/DB FLUSHER TASK ---
         async def ui_db_flusher():
             last_processed = -1
+            last_retries = -1
             while is_running or novel_data_batch:
                 await asyncio.sleep(4) 
                 
@@ -177,30 +179,34 @@ class HealerBot:
                         novel_data_batch.clear()
                         chapter_data_batch.clear()
                         
-                if processed_count > last_processed:
+                # Update UI if anything changed
+                if processed_count > last_processed or active_retries != last_retries:
                     try:
-                        await status_msg.edit_text(f"🔥 Progress: {processed_count}/{total} URLs Processed\n✅ Success: {success_count} | ❌ Failed: {failed_permanently}\nWorkers Active: {MAX_WORKERS} (Max limit for single domain)")
+                        await status_msg.edit_text(
+                            f"🔥 Finalized: {processed_count}/{total}\n"
+                            f"✅ Success: {success_count} | ❌ Failed: {failed_permanently}\n"
+                            f"🔄 Active Retries in Queue: {active_retries}\n"
+                            f"Workers Active: {MAX_WORKERS}"
+                        )
                     except RetryAfter as e:
                         await asyncio.sleep(e.retry_after) 
                     except Exception:
                         pass 
                     last_processed = processed_count
+                    last_retries = active_retries
                     gc.collect() 
 
-        # Launch the Flusher
+        # Launch Tasks
         flusher_task = asyncio.create_task(ui_db_flusher())
-        
-        # Launch the Workers in the ThreadPool
         with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
             workers = [asyncio.create_task(scraper_worker(pool)) for _ in range(MAX_WORKERS)]
             await asyncio.gather(*workers)
             
-        # Cleanup
         is_running = False
         await flusher_task 
         conn.close()
         
-        await status_msg.edit_text(f"✅ DB Build Complete!\n✅ Scraped: {success_count}\n❌ Failed 3x: {failed_permanently}\nSend `/heal` to begin processing.")
+        await status_msg.edit_text(f"✅ DB Build Complete!\n✅ Scraped: {success_count}\n❌ Failed: {failed_permanently}\nSend `/heal` to begin processing.")
 
     async def cmd_heal(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_id = update.effective_chat.id
@@ -240,7 +246,6 @@ class HealerBot:
                 state["step"] = "RUNNING"
                 await update.message.reply_text("🚀 Configuration complete! Starting the Healer Engine...")
 
-                # Fire and forget the healing loop
                 asyncio.create_task(self.run_healing_loop(chat_id, state, context.bot))
 
         except ValueError:
@@ -261,7 +266,6 @@ class HealerBot:
             await status_msg.edit_text(f"🔄 Fetching chunk {chunk_start} to {chunk_end} via Userbot...")
 
             try:
-                # Userbot fetches the 80k messages natively
                 messages = await self.userbot.get_messages(source, msg_ids)
             except Exception as e:
                 await bot.send_message(chat_id=chat_id, text=f"❌ Userbot failed to fetch messages. Is it an admin? Error: {e}")
@@ -278,7 +282,6 @@ class HealerBot:
                     status, result = await loop.run_in_executor(self.executor, analyze_and_fix_epub, epub_path)
 
                     if status == "OK":
-                        # Userbot forwards via internal file_id (Zero Bandwidth)
                         await self.userbot.send_document(ok_chat, document=msg.document.file_id, caption="Status: OK")
 
                     elif status == "FIXED":
@@ -310,7 +313,7 @@ class HealerBot:
                         os.remove(epub_path)
 
     def start(self):
-        print("🚀 Bot Starting (Single-Domain Optimized)...")
+        print("🚀 Bot Starting (Anti-Zombie Config)...")
         app = Application.builder().token(TOKEN).post_init(self.post_init).post_stop(self.post_stop).build()
 
         app.add_handler(CommandHandler("start", self.cmd_start))

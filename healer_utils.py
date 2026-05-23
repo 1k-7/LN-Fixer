@@ -7,19 +7,31 @@ from bs4 import BeautifulSoup
 from lncrawl.core.app import App
 from lncrawl.core.sources import load_sources
 
+# --- THE ZOMBIE THREAD KILLSWITCH ---
+# Cloudscraper/requests will hang forever if a server ignores it. 
+# This forcefully monkey-patches the library to ALWAYS abort after 15 seconds, freeing the thread.
+import requests
+_old_session_request = requests.Session.request
+
+def _new_session_request(self, method, url, **kwargs):
+    if kwargs.get('timeout') is None:
+        kwargs['timeout'] = 15.0
+    return _old_session_request(self, method, url, **kwargs)
+
+requests.Session.request = _new_session_request
+# ------------------------------------
+
 DB_FILE = "data/tocs.sqlite"
 
 def init_db():
     os.makedirs("data", exist_ok=True)
-    # 30s timeout prevents 'database is locked' errors during extreme concurrency
     conn = sqlite3.connect(DB_FILE, timeout=30.0) 
     c = conn.cursor()
     
-    # --- HARDWARE MAXIMIZATION PRAGMAS ---
-    c.execute('PRAGMA journal_mode = WAL;')        # Non-blocking concurrent writes
-    c.execute('PRAGMA synchronous = OFF;')         # Don't wait for OS to write to disk
-    c.execute('PRAGMA cache_size = -1000000;')     # Give SQLite 1GB of pure RAM for caching
-    c.execute('PRAGMA temp_store = MEMORY;')       # Keep temporary operations strictly in RAM
+    c.execute('PRAGMA journal_mode = WAL;')        
+    c.execute('PRAGMA synchronous = OFF;')         
+    c.execute('PRAGMA cache_size = -1000000;')     
+    c.execute('PRAGMA temp_store = MEMORY;')       
     
     c.execute('''CREATE TABLE IF NOT EXISTS novels (url TEXT PRIMARY KEY, title TEXT)''')
     c.execute('''CREATE TABLE IF NOT EXISTS chapters (id TEXT, novel_url TEXT, chapter_index INTEGER)''')
@@ -39,7 +51,6 @@ def scrape_toc_worker(url):
     app = App()
     try:
         app.user_input = url
-        # load_sources() intentionally removed from here to prevent Thread crashes
         app.prepare_search()
         app.get_novel_info()
         
@@ -55,10 +66,6 @@ def scrape_toc_worker(url):
         app.destroy()
 
 def analyze_and_fix_epub(epub_path):
-    """
-    Diagnoses EPUB. Returns (status, result_path_or_url).
-    Statuses: OK, FIXED, MISSING, ERROR
-    """
     extract_dir = epub_path + "_unzipped"
     os.makedirs(extract_dir, exist_ok=True)
     
@@ -69,7 +76,6 @@ def analyze_and_fix_epub(epub_path):
         shutil.rmtree(extract_dir, ignore_errors=True)
         return "ERROR", "Bad Zip File"
 
-    # 1. Extract URL from intro.xhtml
     intro_path = next((os.path.join(r, f) for r, _, fs in os.walk(extract_dir) for f in fs if f == "intro.xhtml"), None)
     if not intro_path:
         shutil.rmtree(extract_dir, ignore_errors=True)
@@ -84,7 +90,6 @@ def analyze_and_fix_epub(epub_path):
         
     source_url = match.group(1)
     
-    # 2. Compare Counts
     db_count = get_db_toc_count(source_url)
     if db_count == 0:
         shutil.rmtree(extract_dir, ignore_errors=True)
@@ -94,9 +99,8 @@ def analyze_and_fix_epub(epub_path):
 
     if len(epub_chapters) < db_count:
         shutil.rmtree(extract_dir, ignore_errors=True)
-        return "MISSING", source_url  # Return URL to trigger redownload
+        return "MISSING", source_url  
 
-    # 3. Check Jumbled Spine
     opf_path = next((os.path.join(r, f) for r, _, fs in os.walk(extract_dir) for f in fs if f.endswith(".opf")), None)
     with open(opf_path, 'r', encoding='utf-8') as f:
         opf_soup = BeautifulSoup(f.read(), 'xml')
@@ -111,7 +115,6 @@ def analyze_and_fix_epub(epub_path):
         shutil.rmtree(extract_dir, ignore_errors=True)
         return "OK", None
 
-    # 4. Fix Jumbled Spine
     def sort_key(tag):
         idref = tag.get('idref')
         if idref.startswith('chapter_'): return (1, int(re.search(r'\d+', idref).group()))
@@ -136,8 +139,6 @@ def analyze_and_fix_epub(epub_path):
     return "FIXED", fixed_epub_path
 
 def redownload_worker(url, out_dir):
-    """Triggers a clean lncrawl download programmatically"""
-    # Requires load_sources because it runs in an isolated ProcessPool container
     load_sources()
     app = App()
     try:
