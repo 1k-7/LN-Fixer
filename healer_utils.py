@@ -3,30 +3,56 @@ import re
 import sqlite3
 import zipfile
 import shutil
+import threading
 import requests
 from requests.adapters import HTTPAdapter
 from bs4 import BeautifulSoup
 
 from lncrawl.core.app import App
 from lncrawl.core.sources import load_sources
-from lncrawl.cloudscraper import create_scraper
+from lncrawl.core.scraper import Scraper
+from lncrawl.core.taskman import TaskManager
 
 # --- THE ZOMBIE THREAD KILLSWITCH ---
 _old_session_request = requests.Session.request
 
 def _new_session_request(self, method, url, **kwargs):
     if kwargs.get('timeout') is None:
-        kwargs['timeout'] = 20.0 # 20s to allow initial CF clearance
+        kwargs['timeout'] = 20.0
     return _old_session_request(self, method, url, **kwargs)
 
 requests.Session.request = _new_session_request
 
-# --- THE SPEED FIX: GLOBAL CONNECTION POOL ---
-# Uses lncrawl's native scraper to bypass Cloudflare ONCE and reuse TCP sockets
-SHARED_SCRAPER = create_scraper()
-adapter = HTTPAdapter(pool_connections=250, pool_maxsize=250, max_retries=1)
-SHARED_SCRAPER.mount('http://', adapter)
-SHARED_SCRAPER.mount('https://', adapter)
+# --- THE SPEED FIX: EXACT NATIVE REPLICATION ---
+# 1. Intercept Scraper initialization to force all instances to share 1 Session per domain.
+# 2. Intercept Scraper.close() to prevent it from killing the shared session.
+_old_init_scraper = Scraper.init_scraper
+SHARED_SCRAPERS = {}
+scraper_lock = threading.Lock()
+
+def _new_init_scraper(self, session=None):
+    domain = self.home_url
+    with scraper_lock:
+        if domain not in SHARED_SCRAPERS:
+            # Create the Cloudscraper instance exactly the way lncrawl natively does
+            _old_init_scraper(self, session)
+            # Mount a massive connection pipeline to handle the 200 threads
+            adapter = HTTPAdapter(pool_connections=200, pool_maxsize=200, max_retries=1)
+            self.scraper.mount('http://', adapter)
+            self.scraper.mount('https://', adapter)
+            SHARED_SCRAPERS[domain] = self.scraper
+        else:
+            # Hijack the crawler and force it to use the pre-approved session
+            self.scraper = SHARED_SCRAPERS[domain]
+
+def _new_scraper_close(self):
+    # DO NOT call self.scraper.close()! We are sharing it across thousands of URLs.
+    # Just clean up the local thread pool executor.
+    TaskManager.close(self)
+
+# Apply the Monkey-Patches
+Scraper.init_scraper = _new_init_scraper
+Scraper.close = _new_scraper_close
 # ---------------------------------------------
 
 DB_FILE = "data/tocs.sqlite"
@@ -55,16 +81,10 @@ def get_db_toc_count(url):
     return count
 
 def scrape_toc_worker(url):
-    """Fetches ONLY the TOC using the massive shared connection pool."""
     app = App()
     try:
         app.user_input = url
-        app.prepare_search() # Initializes app.crawler
-        
-        # INJECT THE NATIVE SHARED SESSION TO REUSE TCP CONNECTIONS
-        if app.crawler:
-            app.crawler.scraper = SHARED_SCRAPER
-            
+        app.prepare_search()
         app.get_novel_info()
         
         chapters = []

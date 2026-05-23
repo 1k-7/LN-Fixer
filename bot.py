@@ -6,7 +6,7 @@ import shutil
 import multiprocessing
 import concurrent.futures
 import gc
-import random
+from urllib.parse import urlparse
 from concurrent.futures import ProcessPoolExecutor
 
 from telegram import Update
@@ -64,7 +64,7 @@ class HealerBot:
 
     async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
-            "🛠 **LN EPUB Healer Ready** (Native Pooling Architecture)\n\n"
+            "🛠 **LN EPUB Healer Ready** (Native Engine Replica)\n\n"
             "1. Send me your URLs JSON file and reply to it with `/builddb` to build the TOC database.\n"
             "2. Once built, send `/heal` to start the channel processing."
         )
@@ -99,26 +99,55 @@ class HealerBot:
             conn.close()
             return await status_msg.edit_text("✅ All URLs are already in the database! Send `/heal` to begin processing.")
 
-        # Shuffle just in case there are multiple domains to spread initial handshake load
-        random.shuffle(urls_to_process)
-
         loop = asyncio.get_running_loop()
 
         await status_msg.edit_text("⚙️ Booting lncrawl core architecture...")
         await loop.run_in_executor(None, load_sources)
 
-        MAX_WORKERS = 250 
-        await status_msg.edit_text(f"🚀 Spooling up Shared Session Pool with {MAX_WORKERS} concurrent workers...")
+        # --- THE WARMUP PHASE ---
+        # We must fetch ONE url per domain to securely solve Cloudflare BEFORE we unleash the threads
+        domain_map = {}
+        for u in urls_to_process:
+            domain = urlparse(u).netloc
+            if domain not in domain_map:
+                domain_map[domain] = u
+                
+        warmup_urls = list(domain_map.values())
+        # Remove warmup URLs from the main list
+        urls_to_process = [u for u in urls_to_process if u not in warmup_urls]
+
+        success_count = 0
+        processed_count = 0
+        failed_permanently = 0
+        
+        for w_url in warmup_urls:
+            domain_name = urlparse(w_url).netloc
+            await status_msg.edit_text(f"⚙️ Warming up & solving Cloudflare for {domain_name}...")
+            res = await loop.run_in_executor(None, scrape_toc_worker, w_url)
+            
+            if not res.get("error"):
+                c.execute("INSERT INTO novels (url, title) VALUES (?, ?)", (res["url"], res["title"]))
+                c.executemany("INSERT INTO chapters (id, novel_url, chapter_index) VALUES (?, ?, ?)", res["chapters"])
+                conn.commit()
+                success_count += 1
+                processed_count += 1
+            else:
+                logger.error(f"❌ Warmup Failed for {w_url}: {res.get('error')}")
+                urls_to_process.append(w_url) # Push it back to retry later
+
+        if not urls_to_process:
+            conn.close()
+            return await status_msg.edit_text(f"✅ DB Build Complete! Scraped {success_count} new TOCs.\nSend `/heal` to begin processing.")
+
+        # --- HIGH SPEED QUEUE ---
+        MAX_WORKERS = 200 
+        await status_msg.edit_text(f"🚀 CF Bypassed. Unleashing Pre-Approved Pool with {MAX_WORKERS} concurrent workers...")
         
         queue = asyncio.Queue()
         for u in urls_to_process:
             queue.put_nowait((u, 0))
 
-        success_count = 0
-        processed_count = 0
-        failed_permanently = 0
         active_retries = 0
-        
         novel_data_batch = []
         chapter_data_batch = []
         is_running = True
@@ -142,20 +171,17 @@ class HealerBot:
 
                 if res.get("error"):
                     if attempts < 3:
-                        # Mark as retrying
                         async with db_lock:
                             active_retries += 1
                         queue.put_nowait((url, attempts + 1))
                         await asyncio.sleep(2.0)
                     else:
-                        # Permanently failed
                         async with db_lock:
                             processed_count += 1
                             failed_permanently += 1
                             active_retries = max(0, active_retries - 1)
                         logger.error(f"❌ DEAD: {url} - {res.get('error')}")
                 else:
-                    # Success
                     async with db_lock:
                         processed_count += 1
                         success_count += 1
@@ -181,14 +207,13 @@ class HealerBot:
                         novel_data_batch.clear()
                         chapter_data_batch.clear()
                         
-                # Update UI if anything changed
                 if processed_count > last_processed or active_retries != last_retries:
                     try:
                         await status_msg.edit_text(
-                            f"⚡ Pipeline Progress: {processed_count}/{total}\n"
+                            f"⚡ Native Engine Progress: {processed_count}/{total}\n"
                             f"✅ Success: {success_count} | ❌ Failed: {failed_permanently}\n"
                             f"🔄 Active Retries in Queue: {active_retries}\n"
-                            f"Workers Active: {MAX_WORKERS} (Native Pool)"
+                            f"Workers Active: {MAX_WORKERS} (100% Pre-Approved Pool)"
                         )
                     except RetryAfter as e:
                         await asyncio.sleep(e.retry_after) 
@@ -315,7 +340,7 @@ class HealerBot:
                         os.remove(epub_path)
 
     def start(self):
-        print("🚀 Bot Starting (Native Pooling Config)...")
+        print("🚀 Bot Starting (Native Architecture Rep)...")
         app = Application.builder().token(TOKEN).post_init(self.post_init).post_stop(self.post_stop).build()
 
         app.add_handler(CommandHandler("start", self.cmd_start))
