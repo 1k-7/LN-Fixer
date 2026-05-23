@@ -2,14 +2,16 @@ import os
 import json
 import asyncio
 import logging
+import shutil
+import multiprocessing
+from concurrent.futures import ProcessPoolExecutor
+
 from pyrogram import Client, filters, idle
 from pyrogram.types import Message
-from concurrent.futures import ProcessPoolExecutor
-import multiprocessing
-import shutil
 
 from healer_utils import init_db, scrape_toc_worker, analyze_and_fix_epub, redownload_worker, DB_FILE
 
+# Enable verbose logging so we can see exactly what Pyrogram is doing
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
@@ -18,10 +20,12 @@ API_HASH = os.getenv("API_HASH", "")
 BOT_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 SESSION_STRING = os.getenv("SESSION_STRING", "")
 
-app = Client("healer_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+# in_memory=True is CRITICAL here to prevent worker processes from locking the session database
+app = Client("healer_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, in_memory=True)
 userbot = Client("healer_userbot", api_id=API_ID, api_hash=API_HASH, session_string=SESSION_STRING, in_memory=True) if SESSION_STRING else None
 
-executor = ProcessPoolExecutor(max_workers=5)
+# Declare globally, but DO NOT initialize until main()
+executor = None
 user_states = {}
 
 DATA_DIR = "data"
@@ -29,8 +33,8 @@ TEMP_DIR = "temp_epubs"
 os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(TEMP_DIR, exist_ok=True)
 
-# Helper function to route uploads based on file size
 async def safe_upload(client, chat_id, file_path, caption):
+    """Routes files > 50MB to the Userbot to bypass Telegram Bot limits."""
     file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
     if file_size_mb > 49.5:
         if userbot:
@@ -40,6 +44,12 @@ async def safe_upload(client, chat_id, file_path, caption):
             await client.send_message(chat_id, f"❌ Failed to upload. File is {file_size_mb:.1f}MB and no Userbot session is configured.")
     else:
         await client.send_document(chat_id, document=file_path, caption=caption)
+
+@app.on_message(filters.command("ping"))
+async def ping_cmd(client, message: Message):
+    """Use this to instantly test if the bot is responsive."""
+    logger.info("Ping command received!")
+    await message.reply("🏓 Pong! The bot is actively listening.")
 
 @app.on_message(filters.command("start"))
 async def start_cmd(client, message: Message):
@@ -92,7 +102,7 @@ async def heal_cmd(client, message: Message):
     user_states[message.chat.id] = {"step": 1}
     await message.reply("📡 Enter the **Source Channel ID** (where the 80k files are):")
 
-@app.on_message(filters.text & filters.private & ~filters.command(["start", "builddb", "heal"]))
+@app.on_message(filters.text & filters.private & ~filters.command(["start", "builddb", "heal", "ping"]))
 async def state_machine(client, message: Message):
     chat_id = message.chat.id
     state = user_states.get(chat_id)
@@ -144,8 +154,13 @@ async def run_healing_loop(client, chat_id, config):
         msg_ids = list(range(chunk_start, chunk_end + 1))
         
         await status_msg.edit(f"🔄 Fetching chunk {chunk_start} to {chunk_end}...")
-        messages = await client.get_messages(source, msg_ids)
         
+        try:
+            messages = await client.get_messages(source, msg_ids)
+        except Exception as e:
+            await client.send_message(chat_id, f"❌ Failed to fetch messages from Source Channel. Is the bot an admin there? Error: {e}")
+            return
+            
         for msg in messages:
             if msg.empty or not msg.document or not msg.document.file_name.endswith('.epub'):
                 continue
@@ -188,15 +203,22 @@ async def run_healing_loop(client, chat_id, config):
                     os.remove(epub_path)
 
 async def main():
+    global executor
+    # Initialize executor safely inside the main loop to prevent Pyrogram socket theft
+    executor = ProcessPoolExecutor(max_workers=3) 
+
     await app.start()
     if userbot:
         await userbot.start()
-        print("✅ Userbot Connected!")
-    print("🚀 Healer Bot Online!")
+        logger.info("✅ Userbot Connected!")
+        
+    logger.info("🚀 Healer Bot Online! Waiting for inputs...")
     await idle()
+    
     await app.stop()
     if userbot:
         await userbot.stop()
+    executor.shutdown(wait=False)
 
 if __name__ == "__main__":
     multiprocessing.freeze_support()
