@@ -4,26 +4,27 @@ import sqlite3
 import zipfile
 import shutil
 import requests
-import cloudscraper
+from requests.adapters import HTTPAdapter
 from bs4 import BeautifulSoup
+
 from lncrawl.core.app import App
 from lncrawl.core.sources import load_sources
+from lncrawl.cloudscraper import create_scraper
 
 # --- THE ZOMBIE THREAD KILLSWITCH ---
 _old_session_request = requests.Session.request
 
 def _new_session_request(self, method, url, **kwargs):
     if kwargs.get('timeout') is None:
-        kwargs['timeout'] = 20.0 # Bumped to 20s to allow initial CF clearance
+        kwargs['timeout'] = 20.0 # 20s to allow initial CF clearance
     return _old_session_request(self, method, url, **kwargs)
 
 requests.Session.request = _new_session_request
 
 # --- THE SPEED FIX: GLOBAL CONNECTION POOL ---
-# This bypasses Cloudflare ONCE and reuses the open TCP sockets for all workers.
-SHARED_SCRAPER = cloudscraper.create_scraper()
-# Create a massive pipeline capable of holding 200 simultaneous open connections
-adapter = requests.adapters.HTTPAdapter(pool_connections=200, pool_maxsize=200, max_retries=1)
+# Uses lncrawl's native scraper to bypass Cloudflare ONCE and reuse TCP sockets
+SHARED_SCRAPER = create_scraper()
+adapter = HTTPAdapter(pool_connections=250, pool_maxsize=250, max_retries=1)
 SHARED_SCRAPER.mount('http://', adapter)
 SHARED_SCRAPER.mount('https://', adapter)
 # ---------------------------------------------
@@ -60,7 +61,7 @@ def scrape_toc_worker(url):
         app.user_input = url
         app.prepare_search() # Initializes app.crawler
         
-        # INJECT THE SHARED SESSION TO BYPASS SSL/CF OVERHEAD
+        # INJECT THE NATIVE SHARED SESSION TO REUSE TCP CONNECTIONS
         if app.crawler:
             app.crawler.scraper = SHARED_SCRAPER
             

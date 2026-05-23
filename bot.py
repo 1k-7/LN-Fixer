@@ -14,7 +14,6 @@ from telegram.ext import Application, CommandHandler, MessageHandler, ContextTyp
 from telegram.error import RetryAfter
 from pyrogram import Client as UserBotClient
 
-# Explicitly load lncrawl sources globally for the threads
 from lncrawl.core.sources import load_sources 
 from healer_utils import init_db, scrape_toc_worker, analyze_and_fix_epub, redownload_worker, DB_FILE
 
@@ -65,7 +64,7 @@ class HealerBot:
 
     async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
-            "🛠 **LN EPUB Healer Ready** (Connection Pooling Enabled)\n\n"
+            "🛠 **LN EPUB Healer Ready** (Native Pooling Architecture)\n\n"
             "1. Send me your URLs JSON file and reply to it with `/builddb` to build the TOC database.\n"
             "2. Once built, send `/heal` to start the channel processing."
         )
@@ -100,13 +99,15 @@ class HealerBot:
             conn.close()
             return await status_msg.edit_text("✅ All URLs are already in the database! Send `/heal` to begin processing.")
 
+        # Shuffle just in case there are multiple domains to spread initial handshake load
+        random.shuffle(urls_to_process)
+
         loop = asyncio.get_running_loop()
 
         await status_msg.edit_text("⚙️ Booting lncrawl core architecture...")
         await loop.run_in_executor(None, load_sources)
 
-        # Connection pooling allows us to safely bump this back up to 150
-        MAX_WORKERS = 150 
+        MAX_WORKERS = 250 
         await status_msg.edit_text(f"🚀 Spooling up Shared Session Pool with {MAX_WORKERS} concurrent workers...")
         
         queue = asyncio.Queue()
@@ -187,7 +188,7 @@ class HealerBot:
                             f"⚡ Pipeline Progress: {processed_count}/{total}\n"
                             f"✅ Success: {success_count} | ❌ Failed: {failed_permanently}\n"
                             f"🔄 Active Retries in Queue: {active_retries}\n"
-                            f"Workers Active: {MAX_WORKERS} (Shared Pool)"
+                            f"Workers Active: {MAX_WORKERS} (Native Pool)"
                         )
                     except RetryAfter as e:
                         await asyncio.sleep(e.retry_after) 
@@ -314,7 +315,7 @@ class HealerBot:
                         os.remove(epub_path)
 
     def start(self):
-        print("🚀 Bot Starting (Connection Pooling Config)...")
+        print("🚀 Bot Starting (Native Pooling Config)...")
         app = Application.builder().token(TOKEN).post_init(self.post_init).post_stop(self.post_stop).build()
 
         app.add_handler(CommandHandler("start", self.cmd_start))
