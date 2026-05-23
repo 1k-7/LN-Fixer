@@ -6,7 +6,7 @@ import shutil
 import multiprocessing
 import concurrent.futures
 import gc
-from urllib.parse import urlparse
+import random
 from concurrent.futures import ProcessPoolExecutor
 
 from telegram import Update
@@ -64,7 +64,7 @@ class HealerBot:
 
     async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
-            "🛠 **LN EPUB Healer Ready** (Native Engine Replica)\n\n"
+            "🛠 **LN EPUB Healer Ready** (Pure Requests Engine)\n\n"
             "1. Send me your URLs JSON file and reply to it with `/builddb` to build the TOC database.\n"
             "2. Once built, send `/heal` to start the channel processing."
         )
@@ -104,50 +104,19 @@ class HealerBot:
         await status_msg.edit_text("⚙️ Booting lncrawl core architecture...")
         await loop.run_in_executor(None, load_sources)
 
-        # --- THE WARMUP PHASE ---
-        # We must fetch ONE url per domain to securely solve Cloudflare BEFORE we unleash the threads
-        domain_map = {}
-        for u in urls_to_process:
-            domain = urlparse(u).netloc
-            if domain not in domain_map:
-                domain_map[domain] = u
-                
-        warmup_urls = list(domain_map.values())
-        # Remove warmup URLs from the main list
-        urls_to_process = [u for u in urls_to_process if u not in warmup_urls]
-
-        success_count = 0
-        processed_count = 0
-        failed_permanently = 0
-        
-        for w_url in warmup_urls:
-            domain_name = urlparse(w_url).netloc
-            await status_msg.edit_text(f"⚙️ Warming up & solving Cloudflare for {domain_name}...")
-            res = await loop.run_in_executor(None, scrape_toc_worker, w_url)
-            
-            if not res.get("error"):
-                c.execute("INSERT INTO novels (url, title) VALUES (?, ?)", (res["url"], res["title"]))
-                c.executemany("INSERT INTO chapters (id, novel_url, chapter_index) VALUES (?, ?, ?)", res["chapters"])
-                conn.commit()
-                success_count += 1
-                processed_count += 1
-            else:
-                logger.error(f"❌ Warmup Failed for {w_url}: {res.get('error')}")
-                urls_to_process.append(w_url) # Push it back to retry later
-
-        if not urls_to_process:
-            conn.close()
-            return await status_msg.edit_text(f"✅ DB Build Complete! Scraped {success_count} new TOCs.\nSend `/heal` to begin processing.")
-
-        # --- HIGH SPEED QUEUE ---
-        MAX_WORKERS = 200 
-        await status_msg.edit_text(f"🚀 CF Bypassed. Unleashing Pre-Approved Pool with {MAX_WORKERS} concurrent workers...")
+        # 80 Workers ensures we maintain ~240 active connections safely due to FanMTL's internal pagination threads
+        MAX_WORKERS = 80 
+        await status_msg.edit_text(f"🚀 Spooling up Pure Requests Engine with {MAX_WORKERS} workers...")
         
         queue = asyncio.Queue()
         for u in urls_to_process:
             queue.put_nowait((u, 0))
 
+        success_count = 0
+        processed_count = 0
+        failed_permanently = 0
         active_retries = 0
+        
         novel_data_batch = []
         chapter_data_batch = []
         is_running = True
@@ -174,7 +143,7 @@ class HealerBot:
                         async with db_lock:
                             active_retries += 1
                         queue.put_nowait((url, attempts + 1))
-                        await asyncio.sleep(2.0)
+                        await asyncio.sleep(1.0)
                     else:
                         async with db_lock:
                             processed_count += 1
@@ -210,10 +179,10 @@ class HealerBot:
                 if processed_count > last_processed or active_retries != last_retries:
                     try:
                         await status_msg.edit_text(
-                            f"⚡ Native Engine Progress: {processed_count}/{total}\n"
+                            f"⚡ Pure Requests Engine: {processed_count}/{total}\n"
                             f"✅ Success: {success_count} | ❌ Failed: {failed_permanently}\n"
                             f"🔄 Active Retries in Queue: {active_retries}\n"
-                            f"Workers Active: {MAX_WORKERS} (100% Pre-Approved Pool)"
+                            f"Workers Active: {MAX_WORKERS} (Tuned for FanMTL)"
                         )
                     except RetryAfter as e:
                         await asyncio.sleep(e.retry_after) 
