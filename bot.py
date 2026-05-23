@@ -66,7 +66,7 @@ class HealerBot:
 
     async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
-            "🛠 **LN EPUB Healer Ready** (Queue Architecture)\n\n"
+            "🛠 **LN EPUB Healer Ready** (High-Speed Queue)\n\n"
             "1. Send me your URLs JSON file and reply to it with `/builddb` to build the TOC database.\n"
             "2. Once built, send `/heal` to start the channel processing."
         )
@@ -107,9 +107,9 @@ class HealerBot:
         await status_msg.edit_text("⚙️ Booting lncrawl core architecture...")
         await loop.run_in_executor(None, load_sources)
 
-        # Let's drop this to 50 temporarily just to see if Cloudflare is the issue
-        MAX_WORKERS = 50 
-        await status_msg.edit_text(f"🚀 Spooling up continuous Queue System with {MAX_WORKERS} concurrent workers...")
+        # High concurrency steady-state (no artificial delays)
+        MAX_WORKERS = 250 
+        await status_msg.edit_text(f"🚀 Spooling up High-Speed Queue System with {MAX_WORKERS} concurrent workers...")
         
         # Load the Queue
         queue = asyncio.Queue()
@@ -129,6 +129,7 @@ class HealerBot:
             nonlocal success_count, processed_count
             while not queue.empty():
                 url = queue.get_nowait()
+                
                 try:
                     # Strict 30s timeout per URL so hanging sites NEVER stall the queue
                     res = await asyncio.wait_for(
@@ -148,7 +149,6 @@ class HealerBot:
                         chapter_data_batch.extend(res.get("chapters", []))
                         success_count += 1
                     else:
-                        # LOG THE SPECIFIC FAILURE SO WE CAN SEE IF IT'S CLOUDFLARE
                         logger.error(f"❌ Scrape Failed for {url}: {res.get('error')}")
 
                 queue.task_done()
@@ -170,11 +170,11 @@ class HealerBot:
                         
                 if processed_count > last_processed:
                     try:
-                        await status_msg.edit_text(f"🔥 Progress: {processed_count}/{total} URLs Scraped ({success_count} successful)\nWorkers Active: {MAX_WORKERS}")
+                        await status_msg.edit_text(f"🔥 Speed Progress: {processed_count}/{total} URLs Scraped ({success_count} successful)\nWorkers Active: {MAX_WORKERS}")
                     except RetryAfter as e:
-                        await asyncio.sleep(e.retry_after) # Obey Telegram if we somehow hit limits
+                        await asyncio.sleep(e.retry_after) 
                     except Exception:
-                        pass # Ignore minor network blips
+                        pass 
                     last_processed = processed_count
                     gc.collect() # Force RAM wipe every 4 seconds
 
@@ -188,7 +188,7 @@ class HealerBot:
             
         # Cleanup
         is_running = False
-        await flusher_task # Wait for final DB flush to complete
+        await flusher_task 
         conn.close()
         
         await status_msg.edit_text(f"✅ DB Build Complete! Scraped {success_count} new TOCs.\nSend `/heal` to begin processing.")
@@ -301,7 +301,7 @@ class HealerBot:
                         os.remove(epub_path)
 
     def start(self):
-        print("🚀 Bot Starting (Queue Architecture)...")
+        print("🚀 Bot Starting (High-Speed Queue)...")
         app = Application.builder().token(TOKEN).post_init(self.post_init).post_stop(self.post_stop).build()
 
         app.add_handler(CommandHandler("start", self.cmd_start))
