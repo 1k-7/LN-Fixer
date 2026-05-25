@@ -115,7 +115,6 @@ class HealerBot:
                 except ValueError:
                     return await update.message.reply_text("⚠️ Please provide a valid positive number. Example: `/checkdb 1`")
 
-                # Grab the specific novel using OFFSET
                 c.execute("SELECT url, title FROM novels ORDER BY ROWID ASC LIMIT 1 OFFSET ?", (entry_idx - 1,))
                 novel = c.fetchone()
                 
@@ -124,25 +123,23 @@ class HealerBot:
                 
                 novel_url, novel_title = novel
                 
-                # Grab all chapters for this novel
-                c.execute("SELECT id, chapter_index FROM chapters WHERE novel_url=? ORDER BY chapter_index ASC", (novel_url,))
+                # Fetch true titles instead of arbitrary IDs
+                c.execute("SELECT chapter_index, chapter_title FROM chapters WHERE novel_url=? ORDER BY chapter_index ASC", (novel_url,))
                 chapters = c.fetchall()
                 
-                # Build the text document content
                 content = f"DATABASE ENTRY #{entry_idx}\n"
                 content += f"=========================================\n"
                 content += f"Title: {novel_title}\n"
                 content += f"URL:   {novel_url}\n"
                 content += f"Total Chapters Extracted: {len(chapters)}\n"
                 content += f"=========================================\n\n"
-                content += "TABLE OF CONTENTS MAP (Index -> Chapter ID)\n"
+                content += "CANONICAL TABLE OF CONTENTS\n"
                 content += "-----------------------------------------\n"
                 
-                for chap_id, chap_idx in chapters:
-                    content += f"[{chap_idx}] -> {chap_id}\n"
+                for chap_idx, chap_title in chapters:
+                    content += f"[{chap_idx}] -> {chap_title}\n"
                     
-                # Write to temp file and upload
-                safe_title = "".join([c for c in novel_title if c.isalpha() or c.isdigit() or c==' ']).rstrip()
+                safe_title = "".join([char for char in novel_title if char.isalpha() or char.isdigit() or char==' ']).rstrip()
                 temp_filename = os.path.join(DATA_DIR, f"entry_{entry_idx}.txt")
                 
                 with open(temp_filename, "w", encoding="utf-8") as f:
@@ -151,7 +148,7 @@ class HealerBot:
                 await update.message.reply_document(
                     document=open(temp_filename, "rb"),
                     filename=f"DB_Entry_{entry_idx}_{safe_title[:15]}.txt",
-                    caption=f"✅ Exported complete database mapping for **{novel_title}**"
+                    caption=f"✅ Exported complete canonical TOC for **{novel_title}**"
                 )
                 
                 os.remove(temp_filename)
@@ -199,7 +196,7 @@ class HealerBot:
         await status_msg.edit_text("⚙️ Booting lncrawl core architecture...")
         await loop.run_in_executor(None, load_sources)
 
-        MAX_WORKERS = 1 
+        MAX_WORKERS = 10 
         await status_msg.edit_text(f"🚀 Detached Background Engine started with {MAX_WORKERS} workers.\nYou can now use `/checkdb` freely!")
         
         queue = asyncio.Queue()
@@ -263,7 +260,8 @@ class HealerBot:
                 async with db_lock:
                     if novel_data_batch:
                         c.executemany("INSERT INTO novels (url, title) VALUES (?, ?)", novel_data_batch)
-                        c.executemany("INSERT INTO chapters (id, novel_url, chapter_index) VALUES (?, ?, ?)", chapter_data_batch)
+                        # SCHEMA UPDATED: INSERT chapter_title instead of id
+                        c.executemany("INSERT INTO chapters (novel_url, chapter_index, chapter_title) VALUES (?, ?, ?)", chapter_data_batch)
                         conn.commit()
                         novel_data_batch.clear()
                         chapter_data_batch.clear()
