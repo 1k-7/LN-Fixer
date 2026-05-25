@@ -2,6 +2,7 @@ import os
 import json
 import asyncio
 import logging
+import sqlite3
 import shutil
 import multiprocessing
 import concurrent.futures
@@ -63,10 +64,51 @@ class HealerBot:
 
     async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
-            "🛠 **LN EPUB Healer Ready** (Pure Native Build)\n\n"
-            "1. Send me your URLs JSON file and reply to it with `/builddb` to build the TOC database.\n"
-            "2. Once built, send `/heal` to start the channel processing."
+            "🛠 **LN EPUB Healer Ready**\n\n"
+            "1. Reply to your JSON file with `/builddb` to build the TOC.\n"
+            "2. Send `/checkdb` to verify database integrity.\n"
+            "3. Send `/heal` to start channel processing."
         )
+
+    # --- NEW FEATURE: DB INTEGRITY CHECKER ---
+    async def cmd_checkdb(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not os.path.exists(DB_FILE):
+            return await update.message.reply_text("⚠️ Database does not exist yet. Run `/builddb` first.")
+            
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        
+        try:
+            c.execute("SELECT COUNT(*) FROM novels")
+            novels_count = c.fetchone()[0]
+            
+            c.execute("SELECT COUNT(*) FROM chapters")
+            chapters_count = c.fetchone()[0]
+            
+            if novels_count == 0:
+                conn.close()
+                return await update.message.reply_text("⚠️ Database exists, but it is completely empty (0 novels).")
+                
+            # Fetch the last 5 novels added
+            c.execute("SELECT url, title FROM novels ORDER BY ROWID DESC LIMIT 5")
+            recent_novels = c.fetchall()
+            
+            msg = f"📊 **Database Integrity Check**\n"
+            msg += f"📚 **Total Novels:** {novels_count}\n"
+            msg += f"📑 **Total Chapters:** {chapters_count}\n\n"
+            msg += f"🔍 **Last 5 Saved Entries:**\n"
+            
+            for url, title in recent_novels:
+                c.execute("SELECT COUNT(*) FROM chapters WHERE novel_url=?", (url,))
+                chap_count = c.fetchone()[0]
+                msg += f"🔹 **{title}**\n   └ Chapters saved: `{chap_count}`\n"
+                
+            await update.message.reply_text(msg)
+        except Exception as e:
+            await update.message.reply_text(f"❌ DB Check Error: {e}")
+        finally:
+            conn.close()
+    # -----------------------------------------
 
     async def cmd_builddb(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not update.message.reply_to_message or not update.message.reply_to_message.document:
@@ -103,9 +145,9 @@ class HealerBot:
         await status_msg.edit_text("⚙️ Booting lncrawl core architecture...")
         await loop.run_in_executor(None, load_sources)
 
-        # 10 WORKERS: Pure stability to prevent Origin Database 520 crashes.
-        MAX_WORKERS = 10 
-        await status_msg.edit_text(f"🚀 Spooling up Native Worker Engine with {MAX_WORKERS} workers...")
+        # ISOLATION TEST: Drop to EXACTLY 1 worker to see if FanMTL is dropping the Oracle IP entirely.
+        MAX_WORKERS = 1 
+        await status_msg.edit_text(f"🚀 Isolation Test: Running with {MAX_WORKERS} worker to test FanMTL IP bans...")
         
         queue = asyncio.Queue()
         for u in urls_to_process:
@@ -142,6 +184,7 @@ class HealerBot:
                         async with db_lock:
                             active_retries += 1
                         queue.put_nowait((url, attempts + 1))
+                        await asyncio.sleep(2.0) # Penalty box
                     else:
                         async with db_lock:
                             processed_count += 1
@@ -177,10 +220,10 @@ class HealerBot:
                 if processed_count > last_processed or active_retries != last_retries:
                     try:
                         await status_msg.edit_text(
-                            f"⚡ Native Stable Progress: {processed_count}/{total}\n"
+                            f"⚡ Isolation Progress: {processed_count}/{total}\n"
                             f"✅ Success: {success_count} | ❌ Failed: {failed_permanently}\n"
                             f"🔄 Active Retries in Queue: {active_retries}\n"
-                            f"Workers Active: {MAX_WORKERS} (Safe Load)"
+                            f"Workers Active: {MAX_WORKERS} (Testing IP Ban)"
                         )
                     except RetryAfter as e:
                         await asyncio.sleep(e.retry_after) 
@@ -307,11 +350,12 @@ class HealerBot:
                         os.remove(epub_path)
 
     def start(self):
-        print("🚀 Bot Starting (Pure Native Fallback)...")
+        print("🚀 Bot Starting (With DB Checker)...")
         app = Application.builder().token(TOKEN).post_init(self.post_init).post_stop(self.post_stop).build()
 
         app.add_handler(CommandHandler("start", self.cmd_start))
         app.add_handler(CommandHandler("builddb", self.cmd_builddb))
+        app.add_handler(CommandHandler("checkdb", self.cmd_checkdb))
         app.add_handler(CommandHandler("heal", self.cmd_heal))
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_text))
 
