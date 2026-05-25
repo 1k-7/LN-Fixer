@@ -6,7 +6,6 @@ import shutil
 import multiprocessing
 import concurrent.futures
 import gc
-import random
 from concurrent.futures import ProcessPoolExecutor
 
 from telegram import Update
@@ -64,7 +63,7 @@ class HealerBot:
 
     async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
-            "🛠 **LN EPUB Healer Ready** (Pure Requests Engine)\n\n"
+            "🛠 **LN EPUB Healer Ready** (Pure Native Build)\n\n"
             "1. Send me your URLs JSON file and reply to it with `/builddb` to build the TOC database.\n"
             "2. Once built, send `/heal` to start the channel processing."
         )
@@ -104,9 +103,9 @@ class HealerBot:
         await status_msg.edit_text("⚙️ Booting lncrawl core architecture...")
         await loop.run_in_executor(None, load_sources)
 
-        # 80 Workers ensures we maintain ~240 active connections safely due to FanMTL's internal pagination threads
-        MAX_WORKERS = 80 
-        await status_msg.edit_text(f"🚀 Spooling up Pure Requests Engine with {MAX_WORKERS} workers...")
+        # 10 WORKERS: Pure stability to prevent Origin Database 520 crashes.
+        MAX_WORKERS = 10 
+        await status_msg.edit_text(f"🚀 Spooling up Native Worker Engine with {MAX_WORKERS} workers...")
         
         queue = asyncio.Queue()
         for u in urls_to_process:
@@ -131,7 +130,7 @@ class HealerBot:
                 try:
                     res = await asyncio.wait_for(
                         loop.run_in_executor(pool, scrape_toc_worker, url), 
-                        timeout=35.0 
+                        timeout=45.0 
                     )
                 except asyncio.TimeoutError:
                     res = {"url": url, "error": "Timeout Error"}
@@ -143,7 +142,6 @@ class HealerBot:
                         async with db_lock:
                             active_retries += 1
                         queue.put_nowait((url, attempts + 1))
-                        await asyncio.sleep(1.0)
                     else:
                         async with db_lock:
                             processed_count += 1
@@ -179,10 +177,10 @@ class HealerBot:
                 if processed_count > last_processed or active_retries != last_retries:
                     try:
                         await status_msg.edit_text(
-                            f"⚡ Pure Requests Engine: {processed_count}/{total}\n"
+                            f"⚡ Native Stable Progress: {processed_count}/{total}\n"
                             f"✅ Success: {success_count} | ❌ Failed: {failed_permanently}\n"
                             f"🔄 Active Retries in Queue: {active_retries}\n"
-                            f"Workers Active: {MAX_WORKERS} (Tuned for FanMTL)"
+                            f"Workers Active: {MAX_WORKERS} (Safe Load)"
                         )
                     except RetryAfter as e:
                         await asyncio.sleep(e.retry_after) 
@@ -309,7 +307,7 @@ class HealerBot:
                         os.remove(epub_path)
 
     def start(self):
-        print("🚀 Bot Starting (Native Architecture Rep)...")
+        print("🚀 Bot Starting (Pure Native Fallback)...")
         app = Application.builder().token(TOKEN).post_init(self.post_init).post_stop(self.post_stop).build()
 
         app.add_handler(CommandHandler("start", self.cmd_start))
