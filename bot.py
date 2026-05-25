@@ -64,13 +64,13 @@ class HealerBot:
 
     async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
-            "🛠 **LN EPUB Healer Ready** (Detached Background Engine)\n\n"
+            "🛠 **LN EPUB Healer Ready**\n\n"
             "1. Reply to your JSON file with `/builddb` to build the TOC.\n"
-            "2. Send `/checkdb` to verify database integrity in real-time.\n"
+            "2. Send `/checkdb` to verify summary, or `/checkdb <number>` to dump a full entry.\n"
             "3. Send `/heal` to start channel processing."
         )
 
-    # --- DB INTEGRITY CHECKER (Now works because it's no longer blocked!) ---
+    # --- ADVANCED DB INTEGRITY CHECKER ---
     async def cmd_checkdb(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not os.path.exists(DB_FILE):
             return await update.message.reply_text("⚠️ Database does not exist yet. Run `/builddb` first.")
@@ -79,31 +79,83 @@ class HealerBot:
         c = conn.cursor()
         
         try:
-            c.execute("SELECT COUNT(*) FROM novels")
-            novels_count = c.fetchone()[0]
-            
-            c.execute("SELECT COUNT(*) FROM chapters")
-            chapters_count = c.fetchone()[0]
-            
-            if novels_count == 0:
-                conn.close()
-                return await update.message.reply_text("⚠️ Database exists, but it is completely empty (0 novels saved).")
+            # NO PARAMETERS: Show Summary
+            if not context.args:
+                c.execute("SELECT COUNT(*) FROM novels")
+                novels_count = c.fetchone()[0]
                 
-            # Fetch the last 5 novels added
-            c.execute("SELECT url, title FROM novels ORDER BY ROWID DESC LIMIT 5")
-            recent_novels = c.fetchall()
-            
-            msg = f"📊 **Database Integrity Check**\n"
-            msg += f"📚 **Total Novels Saved:** {novels_count}\n"
-            msg += f"📑 **Total Chapters Saved:** {chapters_count}\n\n"
-            msg += f"🔍 **Last 5 Saved Entries:**\n"
-            
-            for url, title in recent_novels:
-                c.execute("SELECT COUNT(*) FROM chapters WHERE novel_url=?", (url,))
-                chap_count = c.fetchone()[0]
-                msg += f"🔹 **{title}**\n   └ Chapters saved: `{chap_count}`\n"
+                c.execute("SELECT COUNT(*) FROM chapters")
+                chapters_count = c.fetchone()[0]
                 
-            await update.message.reply_text(msg)
+                if novels_count == 0:
+                    conn.close()
+                    return await update.message.reply_text("⚠️ Database exists, but it is completely empty (0 novels saved).")
+                    
+                c.execute("SELECT url, title FROM novels ORDER BY ROWID DESC LIMIT 5")
+                recent_novels = c.fetchall()
+                
+                msg = f"📊 **Database Integrity Check**\n"
+                msg += f"📚 **Total Novels Saved:** {novels_count}\n"
+                msg += f"📑 **Total Chapters Saved:** {chapters_count}\n\n"
+                msg += f"🔍 **Last 5 Saved Entries:**\n"
+                
+                for url, title in recent_novels:
+                    c.execute("SELECT COUNT(*) FROM chapters WHERE novel_url=?", (url,))
+                    chap_count = c.fetchone()[0]
+                    msg += f"🔹 **{title}**\n   └ Chapters saved: `{chap_count}`\n"
+                
+                msg += "\n💡 *Use `/checkdb <number>` to export the complete TOC data for a specific entry.*"
+                await update.message.reply_text(msg)
+                
+            # WITH PARAMETER: Export Specific Entry as TXT
+            else:
+                try:
+                    entry_idx = int(context.args[0])
+                    if entry_idx < 1: raise ValueError
+                except ValueError:
+                    return await update.message.reply_text("⚠️ Please provide a valid positive number. Example: `/checkdb 1`")
+
+                # Grab the specific novel using OFFSET
+                c.execute("SELECT url, title FROM novels ORDER BY ROWID ASC LIMIT 1 OFFSET ?", (entry_idx - 1,))
+                novel = c.fetchone()
+                
+                if not novel:
+                    return await update.message.reply_text(f"⚠️ Entry #{entry_idx} not found. Are there that many novels in the DB?")
+                
+                novel_url, novel_title = novel
+                
+                # Grab all chapters for this novel
+                c.execute("SELECT id, chapter_index FROM chapters WHERE novel_url=? ORDER BY chapter_index ASC", (novel_url,))
+                chapters = c.fetchall()
+                
+                # Build the text document content
+                content = f"DATABASE ENTRY #{entry_idx}\n"
+                content += f"=========================================\n"
+                content += f"Title: {novel_title}\n"
+                content += f"URL:   {novel_url}\n"
+                content += f"Total Chapters Extracted: {len(chapters)}\n"
+                content += f"=========================================\n\n"
+                content += "TABLE OF CONTENTS MAP (Index -> Chapter ID)\n"
+                content += "-----------------------------------------\n"
+                
+                for chap_id, chap_idx in chapters:
+                    content += f"[{chap_idx}] -> {chap_id}\n"
+                    
+                # Write to temp file and upload
+                safe_title = "".join([c for c in novel_title if c.isalpha() or c.isdigit() or c==' ']).rstrip()
+                temp_filename = os.path.join(DATA_DIR, f"entry_{entry_idx}.txt")
+                
+                with open(temp_filename, "w", encoding="utf-8") as f:
+                    f.write(content)
+                    
+                await update.message.reply_document(
+                    document=open(temp_filename, "rb"),
+                    filename=f"DB_Entry_{entry_idx}_{safe_title[:15]}.txt",
+                    caption=f"✅ Exported complete database mapping for **{novel_title}**"
+                )
+                
+                os.remove(temp_filename)
+
         except Exception as e:
             await update.message.reply_text(f"❌ DB Check Error: {e}")
         finally:
@@ -123,10 +175,8 @@ class HealerBot:
             urls = json.load(f)
         os.remove(temp_path)
 
-        # FIRE AND FORGET: Start the engine in the background and return control to Telegram immediately.
         asyncio.create_task(self.run_build_loop(status_msg, urls))
 
-    # --- THE DETACHED BACKGROUND ENGINE ---
     async def run_build_loop(self, status_msg, urls):
         conn = init_db()
         c = conn.cursor()
@@ -149,7 +199,7 @@ class HealerBot:
         await status_msg.edit_text("⚙️ Booting lncrawl core architecture...")
         await loop.run_in_executor(None, load_sources)
 
-        MAX_WORKERS = 20 
+        MAX_WORKERS = 1 
         await status_msg.edit_text(f"🚀 Detached Background Engine started with {MAX_WORKERS} workers.\nYou can now use `/checkdb` freely!")
         
         queue = asyncio.Queue()
