@@ -196,7 +196,8 @@ class HealerBot:
         await status_msg.edit_text("⚙️ Booting lncrawl core architecture...")
         await loop.run_in_executor(None, load_sources)
 
-        MAX_WORKERS = 10 
+        # REDUCED TO 3: Limits internal pagination threads to ~60 to prevent Cloudflare drops.
+        MAX_WORKERS = 3
         await status_msg.edit_text(f"🚀 Detached Background Engine started with {MAX_WORKERS} workers.\nYou can now use `/checkdb` freely!")
         
         queue = asyncio.Queue()
@@ -233,7 +234,8 @@ class HealerBot:
                         async with db_lock:
                             active_retries += 1
                         queue.put_nowait((url, attempts + 1))
-                        await asyncio.sleep(2.0)
+                        # INCREASED PENALTY: 5 seconds to let FanMTL breathe
+                        await asyncio.sleep(5.0)
                     else:
                         async with db_lock:
                             processed_count += 1
