@@ -64,13 +64,13 @@ class HealerBot:
 
     async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
-            "🛠 **LN EPUB Healer Ready**\n\n"
+            "🛠 **LN EPUB Healer Ready** (Detached Background Engine)\n\n"
             "1. Reply to your JSON file with `/builddb` to build the TOC.\n"
-            "2. Send `/checkdb` to verify database integrity.\n"
+            "2. Send `/checkdb` to verify database integrity in real-time.\n"
             "3. Send `/heal` to start channel processing."
         )
 
-    # --- NEW FEATURE: DB INTEGRITY CHECKER ---
+    # --- DB INTEGRITY CHECKER (Now works because it's no longer blocked!) ---
     async def cmd_checkdb(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not os.path.exists(DB_FILE):
             return await update.message.reply_text("⚠️ Database does not exist yet. Run `/builddb` first.")
@@ -87,15 +87,15 @@ class HealerBot:
             
             if novels_count == 0:
                 conn.close()
-                return await update.message.reply_text("⚠️ Database exists, but it is completely empty (0 novels).")
+                return await update.message.reply_text("⚠️ Database exists, but it is completely empty (0 novels saved).")
                 
             # Fetch the last 5 novels added
             c.execute("SELECT url, title FROM novels ORDER BY ROWID DESC LIMIT 5")
             recent_novels = c.fetchall()
             
             msg = f"📊 **Database Integrity Check**\n"
-            msg += f"📚 **Total Novels:** {novels_count}\n"
-            msg += f"📑 **Total Chapters:** {chapters_count}\n\n"
+            msg += f"📚 **Total Novels Saved:** {novels_count}\n"
+            msg += f"📑 **Total Chapters Saved:** {chapters_count}\n\n"
             msg += f"🔍 **Last 5 Saved Entries:**\n"
             
             for url, title in recent_novels:
@@ -108,7 +108,6 @@ class HealerBot:
             await update.message.reply_text(f"❌ DB Check Error: {e}")
         finally:
             conn.close()
-    # -----------------------------------------
 
     async def cmd_builddb(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not update.message.reply_to_message or not update.message.reply_to_message.document:
@@ -124,6 +123,11 @@ class HealerBot:
             urls = json.load(f)
         os.remove(temp_path)
 
+        # FIRE AND FORGET: Start the engine in the background and return control to Telegram immediately.
+        asyncio.create_task(self.run_build_loop(status_msg, urls))
+
+    # --- THE DETACHED BACKGROUND ENGINE ---
+    async def run_build_loop(self, status_msg, urls):
         conn = init_db()
         c = conn.cursor()
 
@@ -145,9 +149,8 @@ class HealerBot:
         await status_msg.edit_text("⚙️ Booting lncrawl core architecture...")
         await loop.run_in_executor(None, load_sources)
 
-        # ISOLATION TEST: Drop to EXACTLY 1 worker to see if FanMTL is dropping the Oracle IP entirely.
-        MAX_WORKERS = 1 
-        await status_msg.edit_text(f"🚀 Isolation Test: Running with {MAX_WORKERS} worker to test FanMTL IP bans...")
+        MAX_WORKERS = 20 
+        await status_msg.edit_text(f"🚀 Detached Background Engine started with {MAX_WORKERS} workers.\nYou can now use `/checkdb` freely!")
         
         queue = asyncio.Queue()
         for u in urls_to_process:
@@ -163,7 +166,6 @@ class HealerBot:
         is_running = True
         db_lock = asyncio.Lock()
 
-        # --- THE WORKER TASK ---
         async def scraper_worker(pool):
             nonlocal success_count, processed_count, failed_permanently, active_retries
             while not queue.empty():
@@ -184,7 +186,7 @@ class HealerBot:
                         async with db_lock:
                             active_retries += 1
                         queue.put_nowait((url, attempts + 1))
-                        await asyncio.sleep(2.0) # Penalty box
+                        await asyncio.sleep(2.0)
                     else:
                         async with db_lock:
                             processed_count += 1
@@ -202,12 +204,11 @@ class HealerBot:
 
                 queue.task_done()
 
-        # --- THE UI/DB FLUSHER TASK ---
         async def ui_db_flusher():
             last_processed = -1
             last_retries = -1
             while is_running or novel_data_batch:
-                await asyncio.sleep(4) 
+                await asyncio.sleep(5) 
                 
                 async with db_lock:
                     if novel_data_batch:
@@ -220,10 +221,10 @@ class HealerBot:
                 if processed_count > last_processed or active_retries != last_retries:
                     try:
                         await status_msg.edit_text(
-                            f"⚡ Isolation Progress: {processed_count}/{total}\n"
+                            f"⚡ Background Engine: {processed_count}/{total}\n"
                             f"✅ Success: {success_count} | ❌ Failed: {failed_permanently}\n"
                             f"🔄 Active Retries in Queue: {active_retries}\n"
-                            f"Workers Active: {MAX_WORKERS} (Testing IP Ban)"
+                            f"Workers Active: {MAX_WORKERS}"
                         )
                     except RetryAfter as e:
                         await asyncio.sleep(e.retry_after) 
@@ -233,7 +234,6 @@ class HealerBot:
                     last_retries = active_retries
                     gc.collect() 
 
-        # Launch Tasks
         flusher_task = asyncio.create_task(ui_db_flusher())
         with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
             workers = [asyncio.create_task(scraper_worker(pool)) for _ in range(MAX_WORKERS)]
@@ -350,7 +350,7 @@ class HealerBot:
                         os.remove(epub_path)
 
     def start(self):
-        print("🚀 Bot Starting (With DB Checker)...")
+        print("🚀 Bot Starting (Detached Background Queue)...")
         app = Application.builder().token(TOKEN).post_init(self.post_init).post_stop(self.post_stop).build()
 
         app.add_handler(CommandHandler("start", self.cmd_start))
