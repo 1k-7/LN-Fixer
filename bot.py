@@ -64,8 +64,8 @@ class HealerBot:
     async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "🛠 **LN EPUB On-Demand Healer Ready**\n\n"
-            "1. Send `/setup <supergroup_id>` to initialize Topics (e.g. `/setup -100123456789`).\n"
-            "2. Send `/process <message_link>` to start parsing from ID 1 up to the link."
+            "1. Send `/setup <supergroup_id>` to initialize Topics.\n"
+            "2. Send `/process <message_link>` to start parsing."
         )
 
     async def cmd_setup(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -74,27 +74,27 @@ class HealerBot:
             
         try:
             target_chat = int(context.args[0])
-            status_msg = await update.message.reply_text(f"⚙️ Initializing Forum Topics in {target_chat}...")
+            status_msg = await update.message.reply_text(f"⚙️ Initializing Forum Topics via standard Bot API...")
             
-            # Use Userbot to create the topics
-            topic_ok = await self.userbot.create_forum_topic(target_chat, "✅ NO Changes")
-            topic_fixed = await self.userbot.create_forum_topic(target_chat, "🛠 FIXED")
-            topic_redownload = await self.userbot.create_forum_topic(target_chat, "📥 Redownloaded")
+            # Use the Standard Bot API to create topics
+            topic_ok = await context.bot.create_forum_topic(chat_id=target_chat, name="✅ NO Changes")
+            topic_fixed = await context.bot.create_forum_topic(chat_id=target_chat, name="🛠 FIXED")
+            topic_redownload = await context.bot.create_forum_topic(chat_id=target_chat, name="📥 Redownloaded")
             
             self.config = {
                 "target_chat": target_chat,
-                "topic_ok": topic_ok.id,
-                "topic_fixed": topic_fixed.id,
-                "topic_redownloaded": topic_redownload.id
+                "topic_ok": topic_ok.message_thread_id,
+                "topic_fixed": topic_fixed.message_thread_id,
+                "topic_redownloaded": topic_redownload.message_thread_id
             }
             
             with open(CONFIG_FILE, 'w') as f:
-                json.load(self.config, f)
+                json.dump(self.config, f) # Corrected from json.load
                 
             await status_msg.edit_text("✅ Topics created and saved successfully! Send `/process <message_link>` to begin.")
             
         except Exception as e:
-            await update.message.reply_text(f"❌ Setup Failed. Is the Userbot an admin in that group? Error: {e}")
+            await update.message.reply_text(f"❌ Setup Failed. Make sure the Bot (not just Userbot) is an admin. Error: {e}")
 
     async def cmd_process(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not self.config:
@@ -108,7 +108,6 @@ class HealerBot:
             parts = link.rstrip('/').split('/')
             end_msg_id = int(parts[-1])
             
-            # Handle both public (t.me/channel/123) and private (t.me/c/123/456) links
             if 'c' in parts:
                 source_chat = int("-100" + parts[-2])
             else:
@@ -123,6 +122,7 @@ class HealerBot:
     async def process_single_epub(self, msg, loop):
         """Pipeline for a single EPUB file"""
         epub_path = os.path.join(TEMP_DIR, f"{msg.id}.epub")
+        # Userbot strictly handles downloading the historical file
         await msg.download(file_name=epub_path)
 
         url, extract_dir, err = await loop.run_in_executor(self.executor, extract_url_from_epub, epub_path)
@@ -130,16 +130,19 @@ class HealerBot:
             if os.path.exists(epub_path): os.remove(epub_path)
             return "ERROR", err
 
-        # On-the-fly fetch
         canonical_toc, scrape_err = await loop.run_in_executor(self.executor, fetch_live_toc, url)
         if scrape_err or not canonical_toc:
             shutil.rmtree(extract_dir, ignore_errors=True)
             if os.path.exists(epub_path): os.remove(epub_path)
             return "ERROR", f"Failed to scrape live TOC: {scrape_err}"
 
-        # Analyze and Fix
         status, result = await loop.run_in_executor(self.executor, fix_epub_spine, epub_path, extract_dir, canonical_toc)
         
+        # If it was completely perfect, we return the original epub path to upload
+        if status == "OK":
+            return "OK", epub_path
+
+        # Otherwise, clean up the original epub, we are using the new result
         if os.path.exists(epub_path): os.remove(epub_path)
         
         if status == "MISSING":
@@ -156,7 +159,6 @@ class HealerBot:
         status_msg = await bot.send_message(chat_id=chat_id, text="Initializing processing loop...")
         loop = asyncio.get_running_loop()
 
-        # Load lncrawl sources once globally
         await loop.run_in_executor(None, load_sources)
 
         target = self.config["target_chat"]
@@ -169,7 +171,7 @@ class HealerBot:
         redownloaded = 0
         errors = 0
 
-        # Chunk by 10 to keep concurrent scraping requests low
+        # Max 10 concurrent scrapes to pace FanMTL properly
         for chunk_start in range(1, end_msg_id + 1, 10):
             chunk_end = min(chunk_start + 9, end_msg_id)
             msg_ids = list(range(chunk_start, chunk_end + 1))
@@ -180,6 +182,7 @@ class HealerBot:
             )
 
             try:
+                # Userbot pulls the data
                 messages = await self.userbot.get_messages(source_chat, msg_ids)
             except Exception as e:
                 await bot.send_message(chat_id=chat_id, text=f"❌ Userbot failed to fetch messages. Error: {e}")
@@ -190,23 +193,27 @@ class HealerBot:
             if not valid_msgs:
                 continue
 
-            # Process the batch of EPUBs concurrently (max 10 at a time)
             tasks = [self.process_single_epub(msg, loop) for msg in valid_msgs]
             results = await asyncio.gather(*tasks)
 
+            # Standard Bot handles the uploading and routing
             for msg, (status, result) in zip(valid_msgs, results):
                 try:
                     if status == "OK":
-                        await self.userbot.send_document(target, document=msg.document.file_id, reply_to_message_id=t_ok)
+                        with open(result, 'rb') as f:
+                            await bot.send_document(chat_id=target, document=f, message_thread_id=t_ok)
+                        os.remove(result)
                         success += 1
                         
                     elif status == "FIXED":
-                        await self.userbot.send_document(target, document=result, reply_to_message_id=t_fixed)
+                        with open(result, 'rb') as f:
+                            await bot.send_document(chat_id=target, document=f, message_thread_id=t_fixed)
                         os.remove(result)
                         fixed += 1
                         
                     elif status == "REDOWNLOADED":
-                        await self.userbot.send_document(target, document=result, reply_to_message_id=t_re)
+                        with open(result, 'rb') as f:
+                            await bot.send_document(chat_id=target, document=f, message_thread_id=t_re)
                         shutil.rmtree(os.path.dirname(result), ignore_errors=True)
                         redownloaded += 1
                         
