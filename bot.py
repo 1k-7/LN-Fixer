@@ -79,12 +79,14 @@ class HealerBot:
             topic_ok = await context.bot.create_forum_topic(chat_id=target_chat, name="✅ NO Changes")
             topic_fixed = await context.bot.create_forum_topic(chat_id=target_chat, name="🛠 FIXED")
             topic_redownload = await context.bot.create_forum_topic(chat_id=target_chat, name="📥 Redownloaded")
+            topic_logs = await context.bot.create_forum_topic(chat_id=target_chat, name="📜 Logs")
             
             self.config = {
                 "target_chat": target_chat,
                 "topic_ok": topic_ok.message_thread_id,
                 "topic_fixed": topic_fixed.message_thread_id,
-                "topic_redownloaded": topic_redownload.message_thread_id
+                "topic_redownloaded": topic_redownload.message_thread_id,
+                "topic_logs": topic_logs.message_thread_id
             }
             
             with open(CONFIG_FILE, 'w') as f:
@@ -119,36 +121,53 @@ class HealerBot:
         asyncio.create_task(self.run_streaming_loop(update.effective_chat.id, source_chat, end_msg_id, context.bot))
 
     async def process_single_epub(self, msg, loop):
+        """Pipeline for a single EPUB file"""
+        log_data = []
+        original_filename = msg.document.file_name
         epub_path = os.path.join(TEMP_DIR, f"{msg.id}.epub")
         await msg.download(file_name=epub_path)
 
         url, extract_dir, err = await loop.run_in_executor(self.executor, extract_url_from_epub, epub_path)
         if err:
             if os.path.exists(epub_path): os.remove(epub_path)
-            return "ERROR", err
+            log_data.append(f"❌ Extraction Error: {err}")
+            return "ERROR", err, log_data
 
-        canonical_toc, scrape_err = await loop.run_in_executor(self.executor, fetch_live_toc, url)
+        log_data.append(f"🔗 Source URL: `{url}`")
+        canonical_toc, has_duplicates, scrape_err = await loop.run_in_executor(self.executor, fetch_live_toc, url)
+        
         if scrape_err or not canonical_toc:
             shutil.rmtree(extract_dir, ignore_errors=True)
             if os.path.exists(epub_path): os.remove(epub_path)
-            return "ERROR", f"Failed to scrape live TOC: {scrape_err}"
+            log_data.append(f"❌ Scraping Error: {scrape_err}")
+            return "ERROR", f"Failed to scrape live TOC: {scrape_err}", log_data
 
-        status, result = await loop.run_in_executor(self.executor, fix_epub_spine, epub_path, extract_dir, canonical_toc)
+        if has_duplicates:
+            log_data.append("⚠️ Canonical TOC has duplicate chapter titles. Safe sorting is impossible.")
+            status = "REDOWNLOAD"
+            result = None
+        else:
+            status, result = await loop.run_in_executor(self.executor, fix_epub_spine, epub_path, extract_dir, canonical_toc, log_data)
         
         if status == "OK":
-            return "OK", epub_path
+            return "OK", epub_path, log_data
 
         if os.path.exists(epub_path): os.remove(epub_path)
         
-        if status == "MISSING":
+        if status == "REDOWNLOAD" or status == "MISSING":
+            log_data.append("📥 Attempting fresh redownload via lncrawl...")
             redownload_dir = os.path.join(TEMP_DIR, f"redownload_{msg.id}")
             os.makedirs(redownload_dir, exist_ok=True)
             new_epub = await loop.run_in_executor(self.executor, redownload_worker, url, redownload_dir)
             
-            res_path = new_epub if new_epub else f"Failed to redownload {url}"
-            return ("REDOWNLOADED" if new_epub else "ERROR"), res_path
+            if new_epub:
+                log_data.append("✅ Redownload successful.")
+                return "REDOWNLOADED", new_epub, log_data
+            else:
+                log_data.append("❌ Redownload failed.")
+                return "ERROR", f"Failed to redownload {url}", log_data
             
-        return status, result
+        return status, result, log_data
 
     async def run_streaming_loop(self, chat_id, source_chat, end_msg_id, bot):
         status_msg = await bot.send_message(chat_id=chat_id, text="Initializing processing loop...")
@@ -160,6 +179,7 @@ class HealerBot:
         t_ok = self.config["topic_ok"]
         t_fixed = self.config["topic_fixed"]
         t_re = self.config["topic_redownloaded"]
+        t_logs = self.config["topic_logs"]
 
         success = 0
         fixed = 0
@@ -189,41 +209,43 @@ class HealerBot:
             tasks = [self.process_single_epub(msg, loop) for msg in valid_msgs]
             results = await asyncio.gather(*tasks)
 
-            for msg, (status, result) in zip(valid_msgs, results):
+            for msg, (status, result, log_data) in zip(valid_msgs, results):
+                original_filename = msg.document.file_name
+                
+                # Construct and send the log receipt
+                log_text = f"📄 **File:** `{original_filename}`\n⚙️ **Status:** `{status}`\n"
+                log_text += "\n".join(log_data)
                 try:
-                    original_filename = msg.document.file_name
-                    
+                    await bot.send_message(chat_id=target, text=log_text, message_thread_id=t_logs)
+                except Exception as e:
+                    logger.error(f"Failed to send log for {msg.id}: {e}")
+
+                try:
                     if status == "OK":
-                        # Ensure the file physically bears the correct original name
                         final_path = os.path.join(TEMP_DIR, original_filename)
                         os.rename(result, final_path)
                         with open(final_path, 'rb') as f:
-                            await bot.send_document(chat_id=target, document=f, message_thread_id=t_ok)
+                            await bot.send_document(chat_id=target, document=f, filename=original_filename, message_thread_id=t_ok)
                         os.remove(final_path)
                         success += 1
                         
                     elif status == "FIXED":
-                        # Physically rename the file to include [Fixed]
-                        base, ext = os.path.splitext(original_filename)
-                        if not ext: ext = ".epub"
-                        fixed_filename = f"{base} [Fixed]{ext}"
-                        
-                        final_path = os.path.join(TEMP_DIR, fixed_filename)
+                        final_path = os.path.join(TEMP_DIR, original_filename)
                         os.rename(result, final_path)
                         with open(final_path, 'rb') as f:
-                            await bot.send_document(chat_id=target, document=f, message_thread_id=t_fixed)
+                            await bot.send_document(chat_id=target, document=f, filename=original_filename, message_thread_id=t_fixed)
                         os.remove(final_path)
                         fixed += 1
                         
                     elif status == "REDOWNLOADED":
                         # Original redownload keeps its native lncrawl name
+                        new_filename = os.path.basename(result)
                         with open(result, 'rb') as f:
-                            await bot.send_document(chat_id=target, document=f, message_thread_id=t_re)
+                            await bot.send_document(chat_id=target, document=f, filename=new_filename, message_thread_id=t_re)
                         shutil.rmtree(os.path.dirname(result), ignore_errors=True)
                         redownloaded += 1
                         
                     elif status == "ERROR":
-                        await bot.send_message(chat_id=chat_id, text=f"❌ Msg {msg.id} Error: {result}")
                         errors += 1
                 except Exception as e:
                     logger.error(f"Routing failed for {msg.id}: {e}")
@@ -231,7 +253,7 @@ class HealerBot:
         await status_msg.edit_text(f"✅ Streaming Complete! Processed up to ID {end_msg_id}.")
 
     def start(self):
-        print("🚀 Bot Starting (With Physical Renaming & Deep Spine Fixes)...")
+        print("🚀 Bot Starting (Strict Title Matching & Receipts)...")
         app = Application.builder().token(TOKEN).post_init(self.post_init).post_stop(self.post_stop).build()
 
         app.add_handler(CommandHandler("start", self.cmd_start))

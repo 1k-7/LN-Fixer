@@ -3,7 +3,6 @@ import re
 import zipfile
 import shutil
 import requests
-import difflib
 from requests.adapters import HTTPAdapter
 from bs4 import BeautifulSoup
 
@@ -30,7 +29,7 @@ SHARED_SESSION.mount('https://', adapter)
 # -------------------------------------
 
 def normalize_title(t):
-    """Strips spaces, punctuation, and casing for bulletproof title matching."""
+    """Strict normalization. Removes spaces and special chars for 1:1 matching."""
     return re.sub(r'\W+', '', str(t)).lower()
 
 def extract_url_from_epub(epub_path):
@@ -59,6 +58,7 @@ def extract_url_from_epub(epub_path):
     return match.group(1), extract_dir, None
 
 def fetch_live_toc(url):
+    """Fetches TOC and actively looks for duplicate titles to prevent bad sorting."""
     app = App()
     try:
         app.user_input = url
@@ -70,50 +70,60 @@ def fetch_live_toc(url):
         app.get_novel_info()
         
         canonical_toc = {}
+        has_duplicates = False
+        
         for idx, chap in enumerate(app.crawler.chapters):
             chap_title = chap.get('title', '') if isinstance(chap, dict) else getattr(chap, 'title', '')
             norm = normalize_title(chap_title)
+            
             if norm:
+                if norm in canonical_toc:
+                    has_duplicates = True
                 canonical_toc[norm] = idx
                 
-        return canonical_toc, None
+        return canonical_toc, has_duplicates, None
     except Exception as e:
-        return None, str(e)
+        return None, False, str(e)
     finally:
         app.destroy()
 
-def fix_epub_spine(epub_path, extract_dir, canonical_toc):
+def extract_title_from_html(html_path):
+    """Reverse logic: Extracts the exact title lncrawl injected into the file."""
+    with open(html_path, 'r', encoding='utf-8') as f:
+        soup = BeautifulSoup(f.read(), 'html.parser')
+    title_tag = soup.find('title')
+    return title_tag.text.strip() if title_tag else ""
+
+def fix_epub_spine(epub_path, extract_dir, canonical_toc, log_data):
     epub_chapters = [f for r, _, fs in os.walk(extract_dir) for f in fs if f.startswith("chapter_") and f.endswith(".xhtml")]
 
     if len(epub_chapters) < len(canonical_toc):
         shutil.rmtree(extract_dir, ignore_errors=True)
-        return "MISSING", None
+        log_data.append("❌ Missing chapters detected in EPUB compared to live source.")
+        return "REDOWNLOAD", None
 
-    canonical_titles = list(canonical_toc.keys())
-
-    # --- MAP FILES TO TRUE INDEX USING HTML HEADING ---
+    # --- STRICT 1:1 MAP ---
     file_to_true_index = {}
+    seen_epub_titles = set()
+    
     for chap_file in epub_chapters:
         abs_chap_path = next((os.path.join(r, chap_file) for r, _, fs in os.walk(extract_dir) if chap_file in fs), None)
-        with open(abs_chap_path, 'r', encoding='utf-8') as f:
-            chap_soup = BeautifulSoup(f.read(), 'html.parser')
-            
-        # Check all headers to find the actual title, not the novel name
-        heading = chap_soup.find(['h1', 'h2', 'h3', 'h4'])
-        chap_title = heading.text.strip() if heading else ''
-            
+        chap_title = extract_title_from_html(abs_chap_path)
         norm = normalize_title(chap_title)
+        
+        # Duplicate detection inside the EPUB itself
+        if norm in seen_epub_titles:
+            shutil.rmtree(extract_dir, ignore_errors=True)
+            log_data.append(f"⚠️ Duplicate title found inside EPUB: '{chap_title}'. Cannot safely sort.")
+            return "REDOWNLOAD", None
+        seen_epub_titles.add(norm)
         
         if norm in canonical_toc:
             file_to_true_index[chap_file] = canonical_toc[norm]
         else:
-            # FUZZY MATCH: Allow for 70% similarity (catches "Chapter 1:" vs "Chapter 1")
-            matches = difflib.get_close_matches(norm, canonical_titles, n=1, cutoff=0.7)
-            if matches:
-                file_to_true_index[chap_file] = canonical_toc[matches[0]]
-            else:
-                fallback = int(re.search(r'\d+', chap_file).group()) if re.search(r'\d+', chap_file) else 0
-                file_to_true_index[chap_file] = 999999 + fallback
+            shutil.rmtree(extract_dir, ignore_errors=True)
+            log_data.append(f"⚠️ Title '{chap_title}' not found in live source TOC. Source may have changed.")
+            return "REDOWNLOAD", None
 
     # --- 1. REORDER THE .OPF SPINE ---
     opf_path = next((os.path.join(r, f) for r, _, fs in os.walk(extract_dir) for f in fs if f.endswith(".opf")), None)
@@ -129,17 +139,22 @@ def fix_epub_spine(epub_path, extract_dir, canonical_toc):
     def sort_key(tag):
         idref = tag.get('idref')
         href = id_to_href.get(idref)
-        if href and href in file_to_true_index: return (1, file_to_true_index[href])
+        if href:
+            basename = os.path.basename(href.split('#')[0])
+            if basename in file_to_true_index: 
+                return (1, file_to_true_index[basename])
+                
         if idref and idref.startswith('volume_'): 
             vol_num = int(re.search(r'\d+', idref).group()) if re.search(r'\d+', idref) else 0
             return (0, vol_num)
+            
         return (-1, 0)
 
     sorted_itemrefs = sorted(itemrefs, key=sort_key)
     
-    # If the spine is already perfectly ordered, skip processing
     if itemrefs == sorted_itemrefs:
         shutil.rmtree(extract_dir, ignore_errors=True)
+        log_data.append("✅ EPUB is perfectly synced with the live source. No changes needed.")
         return "OK", None
 
     spine.clear()
@@ -148,7 +163,7 @@ def fix_epub_spine(epub_path, extract_dir, canonical_toc):
     with open(opf_path, 'w', encoding='utf-8') as f:
         f.write(str(opf_soup))
 
-    # --- 2. REORDER THE TOC.NCX (For E-Readers) ---
+    # --- 2. REORDER THE TOC.NCX ---
     ncx_path = next((os.path.join(r, f) for r, _, fs in os.walk(extract_dir) for f in fs if f.endswith(".ncx")), None)
     if ncx_path:
         with open(ncx_path, 'r', encoding='utf-8') as f:
@@ -161,19 +176,19 @@ def fix_epub_spine(epub_path, extract_dir, canonical_toc):
             def ncx_sort(tag):
                 content = tag.find('content')
                 src = content.get('src') if content else ''
-                src_clean = src.split('#')[0] # Remove anchors
-                return file_to_true_index.get(src_clean, 999999)
+                basename = os.path.basename(src.split('#')[0])
+                return file_to_true_index.get(basename, 999999)
                 
             sorted_navs = sorted(navpoints, key=ncx_sort)
             navmap.clear()
             for i, nav in enumerate(sorted_navs):
-                nav['playOrder'] = str(i + 1) # Repair play orders sequentially
+                nav['playOrder'] = str(i + 1)
                 navmap.append(nav)
                 
             with open(ncx_path, 'w', encoding='utf-8') as f:
                 f.write(str(ncx_soup))
 
-    # --- 3. REORDER THE TOC.XHTML (For Web Readers) ---
+    # --- 3. REORDER THE TOC.XHTML ---
     toc_xhtml = next((os.path.join(r, f) for r, _, fs in os.walk(extract_dir) for f in fs if f in ["toc.xhtml", "nav.xhtml"]), None)
     if toc_xhtml:
         with open(toc_xhtml, 'r', encoding='utf-8') as f:
@@ -186,8 +201,8 @@ def fix_epub_spine(epub_path, extract_dir, canonical_toc):
             def toc_sort(tag):
                 a_tag = tag.find('a')
                 href = a_tag.get('href') if a_tag else ''
-                href_clean = href.split('#')[0]
-                return file_to_true_index.get(href_clean, 999999)
+                basename = os.path.basename(href.split('#')[0])
+                return file_to_true_index.get(basename, 999999)
                 
             sorted_items = sorted(items, key=toc_sort)
             nav_list.clear()
@@ -205,6 +220,7 @@ def fix_epub_spine(epub_path, extract_dir, canonical_toc):
                 zipf.write(abs_path, os.path.relpath(abs_path, extract_dir))
                 
     shutil.rmtree(extract_dir, ignore_errors=True)
+    log_data.append(f"🛠️ Successfully reordered {len(epub_chapters)} chapters. Spine and TOC rewritten.")
     return "FIXED", fixed_epub_path
 
 def redownload_worker(url, out_dir):
