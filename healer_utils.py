@@ -32,6 +32,26 @@ def normalize_title(t):
     """Strict normalization. Removes spaces and special chars for 1:1 matching."""
     return re.sub(r'\W+', '', str(t)).lower()
 
+def get_sort_tuple(title):
+    """
+    Mathematically forces titles into numerical order to destroy the pagination bug.
+    Handles up to 3 numbers (e.g. Volume 1 Chapter 100 Part 2 -> 1, 100, 2)
+    """
+    t = str(title).lower()
+    
+    # Lock special chapters
+    if 'prologue' in t: return (0, 0, 0, 0)
+    if 'epilogue' in t: return (2, 0, 0, 0)
+    
+    nums = re.findall(r'\d+', t)
+    
+    # (Primary Sort, Num 1, Num 2, Num 3)
+    n1 = int(nums[0]) if len(nums) > 0 else 999999
+    n2 = int(nums[1]) if len(nums) > 1 else 0
+    n3 = int(nums[2]) if len(nums) > 2 else 0
+    
+    return (1, n1, n2, n3)
+
 def extract_url_from_epub(epub_path):
     extract_dir = epub_path + "_unzipped"
     os.makedirs(extract_dir, exist_ok=True)
@@ -58,7 +78,7 @@ def extract_url_from_epub(epub_path):
     return match.group(1), extract_dir, None
 
 def fetch_live_toc(url):
-    """Fetches TOC and actively looks for duplicate titles to prevent bad sorting."""
+    """Fetches TOC, forcefully natural-sorts it, and actively flags duplicates."""
     app = App()
     try:
         app.user_input = url
@@ -69,13 +89,19 @@ def fetch_live_toc(url):
             
         app.get_novel_info()
         
+        raw_chapters = []
+        for chap in app.crawler.chapters:
+            chap_title = chap.get('title', '') if isinstance(chap, dict) else getattr(chap, 'title', '')
+            raw_chapters.append(chap_title)
+            
+        # THE FIX: Force the corrupted asynchronous array into sequential order
+        raw_chapters.sort(key=get_sort_tuple)
+        
         canonical_toc = {}
         has_duplicates = False
         
-        for idx, chap in enumerate(app.crawler.chapters):
-            chap_title = chap.get('title', '') if isinstance(chap, dict) else getattr(chap, 'title', '')
+        for idx, chap_title in enumerate(raw_chapters):
             norm = normalize_title(chap_title)
-            
             if norm:
                 if norm in canonical_toc:
                     has_duplicates = True
@@ -91,6 +117,15 @@ def extract_title_from_html(html_path):
     """Reverse logic: Extracts the exact title lncrawl injected into the file."""
     with open(html_path, 'r', encoding='utf-8') as f:
         soup = BeautifulSoup(f.read(), 'html.parser')
+    
+    # Check headers first for the most accurate title
+    for tag_name in ['h1', 'h2', 'h3', 'title']:
+        tags = soup.find_all(tag_name)
+        for tag in tags:
+            text = tag.text.strip()
+            if re.search(r'\d+', text):
+                return text
+                
     title_tag = soup.find('title')
     return title_tag.text.strip() if title_tag else ""
 
@@ -102,7 +137,7 @@ def fix_epub_spine(epub_path, extract_dir, canonical_toc, log_data):
         log_data.append("❌ Missing chapters detected in EPUB compared to live source.")
         return "REDOWNLOAD", None
 
-    # --- STRICT 1:1 MAP ---
+    # --- STRICT 1:1 REVERSE LOGIC MAP ---
     file_to_true_index = {}
     seen_epub_titles = set()
     
@@ -118,6 +153,7 @@ def fix_epub_spine(epub_path, extract_dir, canonical_toc, log_data):
             return "REDOWNLOAD", None
         seen_epub_titles.add(norm)
         
+        # STRICT Match Only
         if norm in canonical_toc:
             file_to_true_index[chap_file] = canonical_toc[norm]
         else:
@@ -220,7 +256,7 @@ def fix_epub_spine(epub_path, extract_dir, canonical_toc, log_data):
                 zipf.write(abs_path, os.path.relpath(abs_path, extract_dir))
                 
     shutil.rmtree(extract_dir, ignore_errors=True)
-    log_data.append(f"🛠️ Successfully reordered {len(epub_chapters)} chapters. Spine and TOC rewritten.")
+    log_data.append(f"🛠️ Successfully reordered {len(epub_chapters)} chapters. All Spines and TOCs rewritten.")
     return "FIXED", fixed_epub_path
 
 def redownload_worker(url, out_dir):
