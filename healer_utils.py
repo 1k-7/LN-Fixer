@@ -1,63 +1,39 @@
 import os
 import re
-import sqlite3
 import zipfile
 import shutil
+import requests
+from requests.adapters import HTTPAdapter
 from bs4 import BeautifulSoup
 
 from lncrawl.core.app import App
 from lncrawl.core.sources import load_sources
 
-DB_FILE = "data/tocs.sqlite"
+# --- PURE REQUESTS CONNECTION POOL ---
+SHARED_SESSION = requests.Session()
+SHARED_SESSION.headers.update({
+    "User-Agent": "Mozilla/5.0 (Windows NT 11.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+    "Accept-Language": "en-US,en;q=0.9",
+})
 
-def init_db():
-    os.makedirs("data", exist_ok=True)
-    conn = sqlite3.connect(DB_FILE, timeout=30.0) 
-    c = conn.cursor()
-    
-    c.execute('PRAGMA journal_mode = WAL;')        
-    c.execute('PRAGMA synchronous = OFF;')         
-    c.execute('PRAGMA cache_size = -1000000;')     
-    c.execute('PRAGMA temp_store = MEMORY;')       
-    
-    c.execute('''CREATE TABLE IF NOT EXISTS novels (url TEXT PRIMARY KEY, title TEXT)''')
-    # CHANGED: We now store chapter_title instead of a useless ID
-    c.execute('''CREATE TABLE IF NOT EXISTS chapters (novel_url TEXT, chapter_index INTEGER, chapter_title TEXT)''')
-    conn.commit()
-    return conn
+_old_session_request = requests.Session.request
+def _new_session_request(self, method, url, **kwargs):
+    if kwargs.get('timeout') is None:
+        kwargs['timeout'] = 20.0
+    return _old_session_request(self, method, url, **kwargs)
+requests.Session.request = _new_session_request
 
-def get_db_toc_count(url):
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("SELECT COUNT(*) FROM chapters WHERE novel_url=?", (url,))
-    count = c.fetchone()[0]
-    conn.close()
-    return count
+adapter = HTTPAdapter(pool_connections=20, pool_maxsize=20, max_retries=1)
+SHARED_SESSION.mount('http://', adapter)
+SHARED_SESSION.mount('https://', adapter)
+# -------------------------------------
 
 def normalize_title(t):
-    """Strips all spaces, punctuation, and casing for bulletproof matching."""
+    """Strips spaces, punctuation, and casing for bulletproof title matching."""
     return re.sub(r'\W+', '', str(t)).lower()
 
-def scrape_toc_worker(url):
-    app = App()
-    try:
-        app.user_input = url
-        app.prepare_search() 
-        app.get_novel_info()
-        
-        chapters = []
-        for idx, chap in enumerate(app.crawler.chapters):
-            # Extract the actual string title of the chapter
-            chap_title = chap.get('title', '') if isinstance(chap, dict) else getattr(chap, 'title', '')
-            chapters.append((url, idx, str(chap_title)))
-            
-        return {"url": url, "title": app.crawler.novel_title, "chapters": chapters, "error": None}
-    except Exception as e:
-        return {"url": url, "error": str(e)}
-    finally:
-        app.destroy()
-
-def analyze_and_fix_epub(epub_path):
+def extract_url_from_epub(epub_path):
+    """Unzips EPUB, reads intro.xhtml, returns URL, and leaves folder open for processing."""
     extract_dir = epub_path + "_unzipped"
     os.makedirs(extract_dir, exist_ok=True)
     
@@ -66,41 +42,54 @@ def analyze_and_fix_epub(epub_path):
             zip_ref.extractall(extract_dir)
     except zipfile.BadZipFile:
         shutil.rmtree(extract_dir, ignore_errors=True)
-        return "ERROR", "Bad Zip File"
+        return None, extract_dir, "Bad Zip File"
 
     intro_path = next((os.path.join(r, f) for r, _, fs in os.walk(extract_dir) for f in fs if f == "intro.xhtml"), None)
     if not intro_path:
         shutil.rmtree(extract_dir, ignore_errors=True)
-        return "ERROR", "Not an lncrawl generated EPUB (No intro.xhtml)"
+        return None, extract_dir, "No intro.xhtml found"
 
     with open(intro_path, 'r', encoding='utf-8') as f:
         match = re.search(r'Source:</b>\s*<a href="([^"]+)">', f.read())
         
     if not match:
         shutil.rmtree(extract_dir, ignore_errors=True)
-        return "ERROR", "Source URL not found inside EPUB"
+        return None, extract_dir, "Source URL not found inside EPUB"
         
-    source_url = match.group(1)
-    
-    # --- FETCH CANONICAL TOC MAP FROM DATABASE ---
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("SELECT chapter_index, chapter_title FROM chapters WHERE novel_url=?", (source_url,))
-    db_rows = c.fetchall()
-    conn.close()
+    return match.group(1), extract_dir, None
 
-    if not db_rows:
+def fetch_live_toc(url):
+    """Scrapes the website on-the-fly for the canonical TOC."""
+    app = App()
+    try:
+        app.user_input = url
+        app.prepare_search() 
+        
+        if app.crawler:
+            app.crawler.scraper = SHARED_SESSION
+            
+        app.get_novel_info()
+        
+        canonical_toc = {}
+        for idx, chap in enumerate(app.crawler.chapters):
+            chap_title = chap.get('title', '') if isinstance(chap, dict) else getattr(chap, 'title', '')
+            norm = normalize_title(chap_title)
+            if norm:
+                canonical_toc[norm] = idx
+                
+        return canonical_toc, None
+    except Exception as e:
+        return None, str(e)
+    finally:
+        app.destroy()
+
+def fix_epub_spine(epub_path, extract_dir, canonical_toc):
+    """Reads HTML titles, maps to canonical TOC, reorders spine, zips it up."""
+    epub_chapters = [f for r, _, fs in os.walk(extract_dir) for f in fs if f.startswith("chapter_") and f.endswith(".xhtml")]
+
+    if len(epub_chapters) < len(canonical_toc):
         shutil.rmtree(extract_dir, ignore_errors=True)
-        return "ERROR", f"URL not found in DB: {source_url}"
-
-    # Build a lookup dictionary: normalized_title -> true_index
-    canonical_toc = {normalize_title(title): idx for idx, title in db_rows}
-    
-    epub_chapters = [f for r, d, fs in os.walk(extract_dir) for f in fs if f.startswith("chapter_") and f.endswith(".xhtml")]
-
-    if len(epub_chapters) < len(db_rows):
-        shutil.rmtree(extract_dir, ignore_errors=True)
-        return "MISSING", source_url  
+        return "MISSING", None
 
     opf_path = next((os.path.join(r, f) for r, _, fs in os.walk(extract_dir) for f in fs if f.endswith(".opf")), None)
     with open(opf_path, 'r', encoding='utf-8') as f:
@@ -109,41 +98,36 @@ def analyze_and_fix_epub(epub_path):
     manifest = opf_soup.find('manifest')
     id_to_href = {item.get('id'): item.get('href') for item in manifest.find_all('item') if item.get('id')}
 
-    # --- MAP EPUB FILES TO THEIR TRUE INDEX VIA TITLE ---
+    # Match EPUB files to true index via Title
     file_to_true_index = {}
     for chap_file in epub_chapters:
         abs_chap_path = next((os.path.join(r, chap_file) for r, _, fs in os.walk(extract_dir) if chap_file in fs), None)
         with open(abs_chap_path, 'r', encoding='utf-8') as f:
             chap_soup = BeautifulSoup(f.read(), 'html.parser')
             
-        # lncrawl puts the title in <title> and usually <h1> or <h3>
         title_tag = chap_soup.find('title')
         h1_tag = chap_soup.find('h1')
         
         chap_title = ""
-        if title_tag and title_tag.text.strip():
-            chap_title = title_tag.text.strip()
-        elif h1_tag and h1_tag.text.strip():
-            chap_title = h1_tag.text.strip()
+        if title_tag and title_tag.text.strip(): chap_title = title_tag.text.strip()
+        elif h1_tag and h1_tag.text.strip(): chap_title = h1_tag.text.strip()
             
         norm = normalize_title(chap_title)
         
         if norm in canonical_toc:
             file_to_true_index[chap_file] = canonical_toc[norm]
         else:
-            # Fallback if title is inexplicably garbled
             fallback_num = int(re.search(r'\d+', chap_file).group()) if re.search(r'\d+', chap_file) else 0
             file_to_true_index[chap_file] = 999999 + fallback_num
 
-    # --- REORDER THE SPINE ---
+    # Reorder Spine
     spine = opf_soup.find('spine')
     itemrefs = spine.find_all('itemref')
     
     def sort_key(tag):
         idref = tag.get('idref')
         href = id_to_href.get(idref)
-        if href and href in file_to_true_index:
-            return (1, file_to_true_index[href])
+        if href and href in file_to_true_index: return (1, file_to_true_index[href])
         if idref and idref.startswith('volume_'): 
             vol_num = int(re.search(r'\d+', idref).group()) if re.search(r'\d+', idref) else 0
             return (0, vol_num)

@@ -2,20 +2,16 @@ import os
 import json
 import asyncio
 import logging
-import sqlite3
 import shutil
 import multiprocessing
-import concurrent.futures
-import gc
 from concurrent.futures import ProcessPoolExecutor
 
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
-from telegram.error import RetryAfter
 from pyrogram import Client as UserBotClient
 
 from lncrawl.core.sources import load_sources 
-from healer_utils import init_db, scrape_toc_worker, analyze_and_fix_epub, redownload_worker, DB_FILE
+from healer_utils import extract_url_from_epub, fetch_live_toc, fix_epub_spine, redownload_worker
 
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -28,6 +24,7 @@ SESSION_STRING = os.getenv("SESSION_STRING")
 
 DATA_DIR = "data"
 TEMP_DIR = "temp_epubs"
+CONFIG_FILE = os.path.join(DATA_DIR, "config.json")
 os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(TEMP_DIR, exist_ok=True)
 
@@ -35,11 +32,15 @@ class HealerBot:
     def __init__(self):
         self.executor = None
         self.userbot = None
-        self.user_states = {}
+        self.config = {}
 
     async def post_init(self, application: Application):
-        self.executor = ProcessPoolExecutor(max_workers=3)
+        self.executor = ProcessPoolExecutor(max_workers=4)
         
+        if os.path.exists(CONFIG_FILE):
+            with open(CONFIG_FILE, 'r') as f:
+                self.config = json.load(f)
+
         if SESSION_STRING and API_ID:
             try:
                 self.userbot = UserBotClient(
@@ -53,8 +54,6 @@ class HealerBot:
                 logger.info("✅ Pyrogram Userbot Connected!")
             except Exception as e:
                 logger.error(f"❌ Userbot Failed: {e}")
-        else:
-            logger.error("❌ CRITICAL: SESSION_STRING missing. Userbot is required to scan channel history.")
 
     async def post_stop(self, application: Application):
         if self.userbot:
@@ -64,350 +63,168 @@ class HealerBot:
 
     async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
-            "🛠 **LN EPUB Healer Ready**\n\n"
-            "1. Reply to your JSON file with `/builddb` to build the TOC.\n"
-            "2. Send `/checkdb` to verify summary, or `/checkdb <number>` to dump a full entry.\n"
-            "3. Send `/heal` to start channel processing."
+            "🛠 **LN EPUB On-Demand Healer Ready**\n\n"
+            "1. Send `/setup <supergroup_id>` to initialize Topics (e.g. `/setup -100123456789`).\n"
+            "2. Send `/process <message_link>` to start parsing from ID 1 up to the link."
         )
 
-    # --- ADVANCED DB INTEGRITY CHECKER ---
-    async def cmd_checkdb(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not os.path.exists(DB_FILE):
-            return await update.message.reply_text("⚠️ Database does not exist yet. Run `/builddb` first.")
+    async def cmd_setup(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not context.args:
+            return await update.message.reply_text("⚠️ Provide a supergroup ID: `/setup -100123456789`")
             
-        conn = sqlite3.connect(DB_FILE)
-        c = conn.cursor()
-        
         try:
-            # NO PARAMETERS: Show Summary
-            if not context.args:
-                c.execute("SELECT COUNT(*) FROM novels")
-                novels_count = c.fetchone()[0]
+            target_chat = int(context.args[0])
+            status_msg = await update.message.reply_text(f"⚙️ Initializing Forum Topics in {target_chat}...")
+            
+            # Use Userbot to create the topics
+            topic_ok = await self.userbot.create_forum_topic(target_chat, "✅ NO Changes")
+            topic_fixed = await self.userbot.create_forum_topic(target_chat, "🛠 FIXED")
+            topic_redownload = await self.userbot.create_forum_topic(target_chat, "📥 Redownloaded")
+            
+            self.config = {
+                "target_chat": target_chat,
+                "topic_ok": topic_ok.id,
+                "topic_fixed": topic_fixed.id,
+                "topic_redownloaded": topic_redownload.id
+            }
+            
+            with open(CONFIG_FILE, 'w') as f:
+                json.load(self.config, f)
                 
-                c.execute("SELECT COUNT(*) FROM chapters")
-                chapters_count = c.fetchone()[0]
-                
-                if novels_count == 0:
-                    conn.close()
-                    return await update.message.reply_text("⚠️ Database exists, but it is completely empty (0 novels saved).")
-                    
-                c.execute("SELECT url, title FROM novels ORDER BY ROWID DESC LIMIT 5")
-                recent_novels = c.fetchall()
-                
-                msg = f"📊 **Database Integrity Check**\n"
-                msg += f"📚 **Total Novels Saved:** {novels_count}\n"
-                msg += f"📑 **Total Chapters Saved:** {chapters_count}\n\n"
-                msg += f"🔍 **Last 5 Saved Entries:**\n"
-                
-                for url, title in recent_novels:
-                    c.execute("SELECT COUNT(*) FROM chapters WHERE novel_url=?", (url,))
-                    chap_count = c.fetchone()[0]
-                    msg += f"🔹 **{title}**\n   └ Chapters saved: `{chap_count}`\n"
-                
-                msg += "\n💡 *Use `/checkdb <number>` to export the complete TOC data for a specific entry.*"
-                await update.message.reply_text(msg)
-                
-            # WITH PARAMETER: Export Specific Entry as TXT
-            else:
-                try:
-                    entry_idx = int(context.args[0])
-                    if entry_idx < 1: raise ValueError
-                except ValueError:
-                    return await update.message.reply_text("⚠️ Please provide a valid positive number. Example: `/checkdb 1`")
-
-                c.execute("SELECT url, title FROM novels ORDER BY ROWID ASC LIMIT 1 OFFSET ?", (entry_idx - 1,))
-                novel = c.fetchone()
-                
-                if not novel:
-                    return await update.message.reply_text(f"⚠️ Entry #{entry_idx} not found. Are there that many novels in the DB?")
-                
-                novel_url, novel_title = novel
-                
-                # Fetch true titles instead of arbitrary IDs
-                c.execute("SELECT chapter_index, chapter_title FROM chapters WHERE novel_url=? ORDER BY chapter_index ASC", (novel_url,))
-                chapters = c.fetchall()
-                
-                content = f"DATABASE ENTRY #{entry_idx}\n"
-                content += f"=========================================\n"
-                content += f"Title: {novel_title}\n"
-                content += f"URL:   {novel_url}\n"
-                content += f"Total Chapters Extracted: {len(chapters)}\n"
-                content += f"=========================================\n\n"
-                content += "CANONICAL TABLE OF CONTENTS\n"
-                content += "-----------------------------------------\n"
-                
-                for chap_idx, chap_title in chapters:
-                    content += f"[{chap_idx}] -> {chap_title}\n"
-                    
-                safe_title = "".join([char for char in novel_title if char.isalpha() or char.isdigit() or char==' ']).rstrip()
-                temp_filename = os.path.join(DATA_DIR, f"entry_{entry_idx}.txt")
-                
-                with open(temp_filename, "w", encoding="utf-8") as f:
-                    f.write(content)
-                    
-                await update.message.reply_document(
-                    document=open(temp_filename, "rb"),
-                    filename=f"DB_Entry_{entry_idx}_{safe_title[:15]}.txt",
-                    caption=f"✅ Exported complete canonical TOC for **{novel_title}**"
-                )
-                
-                os.remove(temp_filename)
-
+            await status_msg.edit_text("✅ Topics created and saved successfully! Send `/process <message_link>` to begin.")
+            
         except Exception as e:
-            await update.message.reply_text(f"❌ DB Check Error: {e}")
-        finally:
-            conn.close()
+            await update.message.reply_text(f"❌ Setup Failed. Is the Userbot an admin in that group? Error: {e}")
 
-    async def cmd_builddb(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not update.message.reply_to_message or not update.message.reply_to_message.document:
-            return await update.message.reply_text("Reply to a JSON document with /builddb!")
-
-        status_msg = await update.message.reply_text("📥 Downloading JSON...")
-        
-        file = await update.message.reply_to_message.document.get_file()
-        temp_path = os.path.join(DATA_DIR, "temp_urls.json")
-        await file.download_to_drive(temp_path)
-
-        with open(temp_path, 'r', encoding='utf-8') as f:
-            urls = json.load(f)
-        os.remove(temp_path)
-
-        asyncio.create_task(self.run_build_loop(status_msg, urls))
-
-    async def run_build_loop(self, status_msg, urls):
-        conn = init_db()
-        c = conn.cursor()
-
-        await status_msg.edit_text("⚙️ Filtering out existing URLs from the database...")
-
-        urls_to_process = []
-        for url in urls:
-            c.execute("SELECT 1 FROM novels WHERE url=?", (url,))
-            if not c.fetchone():
-                urls_to_process.append(url)
-
-        total = len(urls_to_process)
-        if total == 0:
-            conn.close()
-            return await status_msg.edit_text("✅ All URLs are already in the database! Send `/heal` to begin processing.")
-
-        loop = asyncio.get_running_loop()
-
-        await status_msg.edit_text("⚙️ Booting lncrawl core architecture...")
-        await loop.run_in_executor(None, load_sources)
-
-        # REDUCED TO 3: Limits internal pagination threads to ~60 to prevent Cloudflare drops.
-        MAX_WORKERS = 3
-        await status_msg.edit_text(f"🚀 Detached Background Engine started with {MAX_WORKERS} workers.\nYou can now use `/checkdb` freely!")
-        
-        queue = asyncio.Queue()
-        for u in urls_to_process:
-            queue.put_nowait((u, 0))
-
-        success_count = 0
-        processed_count = 0
-        failed_permanently = 0
-        active_retries = 0
-        
-        novel_data_batch = []
-        chapter_data_batch = []
-        is_running = True
-        db_lock = asyncio.Lock()
-
-        async def scraper_worker(pool):
-            nonlocal success_count, processed_count, failed_permanently, active_retries
-            while not queue.empty():
-                url, attempts = queue.get_nowait()
-                
-                try:
-                    res = await asyncio.wait_for(
-                        loop.run_in_executor(pool, scrape_toc_worker, url), 
-                        timeout=45.0 
-                    )
-                except asyncio.TimeoutError:
-                    res = {"url": url, "error": "Timeout Error"}
-                except Exception as e:
-                    res = {"url": url, "error": str(e)}
-
-                if res.get("error"):
-                    if attempts < 3:
-                        async with db_lock:
-                            active_retries += 1
-                        queue.put_nowait((url, attempts + 1))
-                        # INCREASED PENALTY: 5 seconds to let FanMTL breathe
-                        await asyncio.sleep(5.0)
-                    else:
-                        async with db_lock:
-                            processed_count += 1
-                            failed_permanently += 1
-                            active_retries = max(0, active_retries - 1)
-                        logger.error(f"❌ DEAD: {url} - {res.get('error')}")
-                else:
-                    async with db_lock:
-                        processed_count += 1
-                        success_count += 1
-                        if attempts > 0:
-                            active_retries = max(0, active_retries - 1)
-                        novel_data_batch.append((res["url"], res.get("title", "Unknown")))
-                        chapter_data_batch.extend(res.get("chapters", []))
-
-                queue.task_done()
-
-        async def ui_db_flusher():
-            last_processed = -1
-            last_retries = -1
-            while is_running or novel_data_batch:
-                await asyncio.sleep(5) 
-                
-                async with db_lock:
-                    if novel_data_batch:
-                        c.executemany("INSERT INTO novels (url, title) VALUES (?, ?)", novel_data_batch)
-                        # SCHEMA UPDATED: INSERT chapter_title instead of id
-                        c.executemany("INSERT INTO chapters (novel_url, chapter_index, chapter_title) VALUES (?, ?, ?)", chapter_data_batch)
-                        conn.commit()
-                        novel_data_batch.clear()
-                        chapter_data_batch.clear()
-                        
-                if processed_count > last_processed or active_retries != last_retries:
-                    try:
-                        await status_msg.edit_text(
-                            f"⚡ Background Engine: {processed_count}/{total}\n"
-                            f"✅ Success: {success_count} | ❌ Failed: {failed_permanently}\n"
-                            f"🔄 Active Retries in Queue: {active_retries}\n"
-                            f"Workers Active: {MAX_WORKERS}"
-                        )
-                    except RetryAfter as e:
-                        await asyncio.sleep(e.retry_after) 
-                    except Exception:
-                        pass 
-                    last_processed = processed_count
-                    last_retries = active_retries
-                    gc.collect() 
-
-        flusher_task = asyncio.create_task(ui_db_flusher())
-        with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-            workers = [asyncio.create_task(scraper_worker(pool)) for _ in range(MAX_WORKERS)]
-            await asyncio.gather(*workers)
+    async def cmd_process(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not self.config:
+            return await update.message.reply_text("⚠️ Run `/setup` first to create the Topics.")
             
-        is_running = False
-        await flusher_task 
-        conn.close()
-        
-        await status_msg.edit_text(f"✅ DB Build Complete!\n✅ Scraped: {success_count}\n❌ Failed: {failed_permanently}\nSend `/heal` to begin processing.")
-
-    async def cmd_heal(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        chat_id = update.effective_chat.id
-        self.user_states[chat_id] = {"step": 1}
-        await update.message.reply_text("📡 Enter the **Source Channel ID** (where the 80k files are):")
-
-    async def handle_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        chat_id = update.effective_chat.id
-        state = self.user_states.get(chat_id)
-        if not state: return
-
+        if not context.args:
+            return await update.message.reply_text("⚠️ Provide the final message link: `/process https://t.me/c/123456789/5000`")
+            
+        link = context.args[0]
         try:
-            val = int(update.message.text.strip())
+            parts = link.rstrip('/').split('/')
+            end_msg_id = int(parts[-1])
+            
+            # Handle both public (t.me/channel/123) and private (t.me/c/123/456) links
+            if 'c' in parts:
+                source_chat = int("-100" + parts[-2])
+            else:
+                source_chat = parts[-2]
+                
+        except Exception:
+            return await update.message.reply_text("⚠️ Invalid message link format.")
 
-            if state["step"] == 1:
-                state["source_chat"] = val
-                state["step"] = 2
-                await update.message.reply_text("✅ Got Source. Now enter the **Target OK Channel ID** (for perfect files):")
+        await update.message.reply_text(f"🚀 Streaming Engine Started!\nSource: `{source_chat}`\nTarget ID: `1` to `{end_msg_id}`")
+        asyncio.create_task(self.run_streaming_loop(update.effective_chat.id, source_chat, end_msg_id, context.bot))
 
-            elif state["step"] == 2:
-                state["ok_chat"] = val
-                state["step"] = 3
-                await update.message.reply_text("✅ Got OK Channel. Now enter the **Target FIXED Channel ID** (for reordered/redownloaded files):")
+    async def process_single_epub(self, msg, loop):
+        """Pipeline for a single EPUB file"""
+        epub_path = os.path.join(TEMP_DIR, f"{msg.id}.epub")
+        await msg.download(file_name=epub_path)
 
-            elif state["step"] == 3:
-                state["fixed_chat"] = val
-                state["step"] = 4
-                await update.message.reply_text("✅ Got Fixed Channel. Enter the **Start Message ID**:")
+        url, extract_dir, err = await loop.run_in_executor(self.executor, extract_url_from_epub, epub_path)
+        if err:
+            if os.path.exists(epub_path): os.remove(epub_path)
+            return "ERROR", err
 
-            elif state["step"] == 4:
-                state["start_msg"] = val
-                state["step"] = 5
-                await update.message.reply_text("✅ Got Start ID. Enter the **End Message ID**:")
+        # On-the-fly fetch
+        canonical_toc, scrape_err = await loop.run_in_executor(self.executor, fetch_live_toc, url)
+        if scrape_err or not canonical_toc:
+            shutil.rmtree(extract_dir, ignore_errors=True)
+            if os.path.exists(epub_path): os.remove(epub_path)
+            return "ERROR", f"Failed to scrape live TOC: {scrape_err}"
 
-            elif state["step"] == 5:
-                state["end_msg"] = val
-                state["step"] = "RUNNING"
-                await update.message.reply_text("🚀 Configuration complete! Starting the Healer Engine...")
+        # Analyze and Fix
+        status, result = await loop.run_in_executor(self.executor, fix_epub_spine, epub_path, extract_dir, canonical_toc)
+        
+        if os.path.exists(epub_path): os.remove(epub_path)
+        
+        if status == "MISSING":
+            redownload_dir = os.path.join(TEMP_DIR, f"redownload_{msg.id}")
+            os.makedirs(redownload_dir, exist_ok=True)
+            new_epub = await loop.run_in_executor(self.executor, redownload_worker, url, redownload_dir)
+            
+            res_path = new_epub if new_epub else f"Failed to redownload {url}"
+            return ("REDOWNLOADED" if new_epub else "ERROR"), res_path
+            
+        return status, result
 
-                asyncio.create_task(self.run_healing_loop(chat_id, state, context.bot))
-
-        except ValueError:
-            await update.message.reply_text("⚠️ Please enter a valid number/ID.")
-
-    async def run_healing_loop(self, chat_id, config, bot):
+    async def run_streaming_loop(self, chat_id, source_chat, end_msg_id, bot):
         status_msg = await bot.send_message(chat_id=chat_id, text="Initializing processing loop...")
         loop = asyncio.get_running_loop()
 
-        source = config["source_chat"]
-        ok_chat = config["ok_chat"]
-        fixed_chat = config["fixed_chat"]
+        # Load lncrawl sources once globally
+        await loop.run_in_executor(None, load_sources)
 
-        for chunk_start in range(config["start_msg"], config["end_msg"] + 1, 200):
-            chunk_end = min(chunk_start + 199, config["end_msg"])
+        target = self.config["target_chat"]
+        t_ok = self.config["topic_ok"]
+        t_fixed = self.config["topic_fixed"]
+        t_re = self.config["topic_redownloaded"]
+
+        success = 0
+        fixed = 0
+        redownloaded = 0
+        errors = 0
+
+        # Chunk by 10 to keep concurrent scraping requests low
+        for chunk_start in range(1, end_msg_id + 1, 10):
+            chunk_end = min(chunk_start + 9, end_msg_id)
             msg_ids = list(range(chunk_start, chunk_end + 1))
 
-            await status_msg.edit_text(f"🔄 Fetching chunk {chunk_start} to {chunk_end} via Userbot...")
+            await status_msg.edit_text(
+                f"🔄 Processing IDs {chunk_start} to {chunk_end}...\n"
+                f"✅ OK: {success} | 🛠 Fixed: {fixed} | 📥 Redownloaded: {redownloaded} | ❌ Errors: {errors}"
+            )
 
             try:
-                messages = await self.userbot.get_messages(source, msg_ids)
+                messages = await self.userbot.get_messages(source_chat, msg_ids)
             except Exception as e:
-                await bot.send_message(chat_id=chat_id, text=f"❌ Userbot failed to fetch messages. Is it an admin? Error: {e}")
+                await bot.send_message(chat_id=chat_id, text=f"❌ Userbot failed to fetch messages. Error: {e}")
                 return
 
-            for msg in messages:
-                if msg.empty or not msg.document or not msg.document.file_name.endswith('.epub'):
-                    continue
+            valid_msgs = [m for m in messages if m and not m.empty and m.document and m.document.file_name.endswith('.epub')]
+            
+            if not valid_msgs:
+                continue
 
-                epub_path = os.path.join(TEMP_DIR, f"{msg.id}.epub")
-                await msg.download(file_name=epub_path)
+            # Process the batch of EPUBs concurrently (max 10 at a time)
+            tasks = [self.process_single_epub(msg, loop) for msg in valid_msgs]
+            results = await asyncio.gather(*tasks)
 
+            for msg, (status, result) in zip(valid_msgs, results):
                 try:
-                    status, result = await loop.run_in_executor(self.executor, analyze_and_fix_epub, epub_path)
-
                     if status == "OK":
-                        await self.userbot.send_document(ok_chat, document=msg.document.file_id, caption="Status: OK")
-
+                        await self.userbot.send_document(target, document=msg.document.file_id, reply_to_message_id=t_ok)
+                        success += 1
+                        
                     elif status == "FIXED":
-                        await self.userbot.send_document(fixed_chat, document=result, caption="Status: Fixed Jumbled Spine")
+                        await self.userbot.send_document(target, document=result, reply_to_message_id=t_fixed)
                         os.remove(result)
-
-                    elif status == "MISSING":
-                        source_url = result
-                        await bot.send_message(chat_id=chat_id, text=f"⚠️ Msg {msg.id}: Missing chapters detected. Redownloading {source_url}...")
-
-                        redownload_dir = os.path.join(TEMP_DIR, f"redownload_{msg.id}")
-                        os.makedirs(redownload_dir, exist_ok=True)
-
-                        new_epub = await loop.run_in_executor(self.executor, redownload_worker, source_url, redownload_dir)
-                        if new_epub:
-                            await self.userbot.send_document(fixed_chat, document=new_epub, caption="Status: Redownloaded Missing Chapters")
-                        else:
-                            await bot.send_message(chat_id=chat_id, text=f"❌ Failed to redownload Msg {msg.id}.")
-
-                        shutil.rmtree(redownload_dir, ignore_errors=True)
-
+                        fixed += 1
+                        
+                    elif status == "REDOWNLOADED":
+                        await self.userbot.send_document(target, document=result, reply_to_message_id=t_re)
+                        shutil.rmtree(os.path.dirname(result), ignore_errors=True)
+                        redownloaded += 1
+                        
                     elif status == "ERROR":
                         await bot.send_message(chat_id=chat_id, text=f"❌ Msg {msg.id} Error: {result}")
-
+                        errors += 1
                 except Exception as e:
-                    logger.error(f"Error processing {msg.id}: {e}")
-                finally:
-                    if os.path.exists(epub_path):
-                        os.remove(epub_path)
+                    logger.error(f"Routing failed for {msg.id}: {e}")
+
+        await status_msg.edit_text(f"✅ Streaming Complete! Processed up to ID {end_msg_id}.")
 
     def start(self):
-        print("🚀 Bot Starting (Detached Background Queue)...")
+        print("🚀 Bot Starting (On-Demand Streaming Architecture)...")
         app = Application.builder().token(TOKEN).post_init(self.post_init).post_stop(self.post_stop).build()
 
         app.add_handler(CommandHandler("start", self.cmd_start))
-        app.add_handler(CommandHandler("builddb", self.cmd_builddb))
-        app.add_handler(CommandHandler("checkdb", self.cmd_checkdb))
-        app.add_handler(CommandHandler("heal", self.cmd_heal))
-        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_text))
+        app.add_handler(CommandHandler("setup", self.cmd_setup))
+        app.add_handler(CommandHandler("process", self.cmd_process))
 
         app.run_polling()
 
