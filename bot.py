@@ -1,268 +1,259 @@
 import os
-import json
-import asyncio
-import logging
+import re
+import zipfile
 import shutil
-import multiprocessing
-from concurrent.futures import ProcessPoolExecutor
+import requests
+import html
+import concurrent.futures
+from requests.adapters import HTTPAdapter
+from bs4 import BeautifulSoup
 
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
-from pyrogram import Client as UserBotClient
+from lncrawl.core.app import App
+from lncrawl.core.sources import load_sources
 
-from lncrawl.core.sources import load_sources 
-from healer_utils import extract_url_from_epub, fetch_live_toc, fix_epub_spine, redownload_worker
+# --- PURE REQUESTS CONNECTION POOL ---
+SHARED_SESSION = requests.Session()
+SHARED_SESSION.headers.update({
+    "User-Agent": "Mozilla/5.0 (Windows NT 11.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+    "Accept-Language": "en-US,en;q=0.9",
+})
 
-logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
-logger = logging.getLogger(__name__)
+_old_session_request = requests.Session.request
+def _new_session_request(self, method, url, **kwargs):
+    if kwargs.get('timeout') is None:
+        kwargs['timeout'] = 20.0
+    return _old_session_request(self, method, url, **kwargs)
+requests.Session.request = _new_session_request
 
-# Config
-TOKEN = os.getenv("TELEGRAM_TOKEN")
-API_ID = os.getenv("API_ID")
-API_HASH = os.getenv("API_HASH")
-SESSION_STRING = os.getenv("SESSION_STRING")
+adapter = HTTPAdapter(pool_connections=20, pool_maxsize=20, max_retries=1)
+SHARED_SESSION.mount('http://', adapter)
+SHARED_SESSION.mount('https://', adapter)
+# -------------------------------------
 
-DATA_DIR = "data"
-TEMP_DIR = "temp_epubs"
-CONFIG_FILE = os.path.join(DATA_DIR, "config.json")
-os.makedirs(DATA_DIR, exist_ok=True)
-os.makedirs(TEMP_DIR, exist_ok=True)
+# --- THREAD POOL OVERRIDE FOR PERFECT TOC ORDER ---
+_original_executor = concurrent.futures.ThreadPoolExecutor
 
-class HealerBot:
-    def __init__(self):
-        self.executor = None
-        self.userbot = None
-        self.config = {}
+class SingleThreadExecutor(_original_executor):
+    """Forces lncrawl pagination to run sequentially so the TOC is never jumbled."""
+    def __init__(self, *args, **kwargs):
+        super().__init__(max_workers=1)
+# --------------------------------------------------
 
-    async def post_init(self, application: Application):
-        self.executor = ProcessPoolExecutor(max_workers=4)
+def clean_text(text):
+    """Word-for-Word mapping: Unescapes HTML and standardizes spacing."""
+    if text is None: return ""
+    decoded = html.unescape(str(text))
+    return " ".join(decoded.split())
+
+def extract_url_from_epub(epub_path):
+    extract_dir = epub_path + "_unzipped"
+    os.makedirs(extract_dir, exist_ok=True)
+    
+    try:
+        with zipfile.ZipFile(epub_path, 'r') as zip_ref:
+            zip_ref.extractall(extract_dir)
+    except zipfile.BadZipFile:
+        shutil.rmtree(extract_dir, ignore_errors=True)
+        return None, extract_dir, "Bad Zip File"
+
+    intro_path = next((os.path.join(r, f) for r, _, fs in os.walk(extract_dir) for f in fs if f == "intro.xhtml"), None)
+    if not intro_path:
+        shutil.rmtree(extract_dir, ignore_errors=True)
+        return None, extract_dir, "No intro.xhtml found"
+
+    with open(intro_path, 'r', encoding='utf-8') as f:
+        match = re.search(r'Source:</b>\s*<a href="([^"]+)">', f.read())
         
-        if os.path.exists(CONFIG_FILE):
-            with open(CONFIG_FILE, 'r') as f:
-                self.config = json.load(f)
-
-        if SESSION_STRING and API_ID:
-            try:
-                self.userbot = UserBotClient(
-                    "healer_userbot",
-                    api_id=int(API_ID),
-                    api_hash=API_HASH,
-                    session_string=SESSION_STRING,
-                    in_memory=True
-                )
-                await self.userbot.start()
-                logger.info("✅ Pyrogram Userbot Connected!")
-            except Exception as e:
-                logger.error(f"❌ Userbot Failed: {e}")
-
-    async def post_stop(self, application: Application):
-        if self.userbot:
-            await self.userbot.stop()
-        if self.executor:
-            self.executor.shutdown(wait=False)
-
-    async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text(
-            "🛠 **LN EPUB On-Demand Healer Ready**\n\n"
-            "1. Send `/setup <supergroup_id>` to initialize Topics.\n"
-            "2. Send `/process <message_link>` to start parsing."
-        )
-
-    async def cmd_setup(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not context.args:
-            return await update.message.reply_text("⚠️ Provide a supergroup ID: `/setup -100123456789`")
-            
-        try:
-            target_chat = int(context.args[0])
-            status_msg = await update.message.reply_text(f"⚙️ Initializing Forum Topics via standard Bot API...")
-            
-            topic_ok = await context.bot.create_forum_topic(chat_id=target_chat, name="✅ NO Changes")
-            topic_fixed = await context.bot.create_forum_topic(chat_id=target_chat, name="🛠 FIXED")
-            topic_redownload = await context.bot.create_forum_topic(chat_id=target_chat, name="📥 Redownloaded")
-            topic_logs = await context.bot.create_forum_topic(chat_id=target_chat, name="📜 Logs")
-            
-            self.config = {
-                "target_chat": target_chat,
-                "topic_ok": topic_ok.message_thread_id,
-                "topic_fixed": topic_fixed.message_thread_id,
-                "topic_redownloaded": topic_redownload.message_thread_id,
-                "topic_logs": topic_logs.message_thread_id
-            }
-            
-            with open(CONFIG_FILE, 'w') as f:
-                json.dump(self.config, f) 
-                
-            await status_msg.edit_text("✅ Topics created and saved successfully! Send `/process <message_link>` to begin.")
-            
-        except Exception as e:
-            await update.message.reply_text(f"❌ Setup Failed. Make sure the Bot (not just Userbot) is an admin. Error: {e}")
-
-    async def cmd_process(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not self.config:
-            return await update.message.reply_text("⚠️ Run `/setup` first to create the Topics.")
-            
-        if not context.args:
-            return await update.message.reply_text("⚠️ Provide the final message link: `/process https://t.me/c/123456789/5000`")
-            
-        link = context.args[0]
-        try:
-            parts = link.rstrip('/').split('/')
-            end_msg_id = int(parts[-1])
-            
-            if 'c' in parts:
-                source_chat = int("-100" + parts[-2])
-            else:
-                source_chat = parts[-2]
-                
-        except Exception:
-            return await update.message.reply_text("⚠️ Invalid message link format.")
-
-        await update.message.reply_text(f"🚀 Streaming Engine Started!\nSource: `{source_chat}`\nTarget ID: `1` to `{end_msg_id}`")
-        asyncio.create_task(self.run_streaming_loop(update.effective_chat.id, source_chat, end_msg_id, context.bot))
-
-    async def process_single_epub(self, msg, loop):
-        """Pipeline for a single EPUB file"""
-        log_data = []
-        original_filename = msg.document.file_name
-        epub_path = os.path.join(TEMP_DIR, f"{msg.id}.epub")
-        await msg.download(file_name=epub_path)
-
-        url, extract_dir, err = await loop.run_in_executor(self.executor, extract_url_from_epub, epub_path)
-        if err:
-            if os.path.exists(epub_path): os.remove(epub_path)
-            log_data.append(f"❌ Extraction Error: {err}")
-            return "ERROR", err, log_data
-
-        log_data.append(f"🔗 Source URL: `{url}`")
-        canonical_toc, has_duplicates, scrape_err = await loop.run_in_executor(self.executor, fetch_live_toc, url)
+    if not match:
+        shutil.rmtree(extract_dir, ignore_errors=True)
+        return None, extract_dir, "Source URL not found inside EPUB"
         
-        if scrape_err or not canonical_toc:
+    return match.group(1), extract_dir, None
+
+def fetch_live_toc(url):
+    app = App()
+    
+    # FORCE 1 WORKER to guarantee pages are fetched and appended in order
+    concurrent.futures.ThreadPoolExecutor = SingleThreadExecutor
+    try:
+        app.user_input = url
+        app.prepare_search() 
+        
+        if app.crawler:
+            app.crawler.scraper = SHARED_SESSION
+            
+        app.get_novel_info()
+        
+        canonical_toc = {}
+        has_duplicates = False
+        
+        for idx, chap in enumerate(app.crawler.chapters):
+            chap_title = chap.get('title', '') if isinstance(chap, dict) else getattr(chap, 'title', '')
+            cleaned = clean_text(chap_title)
+            
+            if cleaned:
+                if cleaned in canonical_toc:
+                    has_duplicates = True
+                canonical_toc[cleaned] = idx
+                
+        return canonical_toc, has_duplicates, None
+    except Exception as e:
+        return None, False, str(e)
+    finally:
+        # Restore normal multi-threading so other bots/processes aren't crippled
+        concurrent.futures.ThreadPoolExecutor = _original_executor
+        app.destroy()
+
+def extract_title_from_html(html_path):
+    """Reverse logic: Target exactly what lncrawl injects into the <title> tag."""
+    with open(html_path, 'r', encoding='utf-8') as f:
+        soup = BeautifulSoup(f.read(), 'html.parser')
+    title_tag = soup.find('title')
+    return title_tag.text if title_tag else ""
+
+def fix_epub_spine(epub_path, extract_dir, canonical_toc, log_data):
+    epub_chapters = [f for r, _, fs in os.walk(extract_dir) for f in fs if f.startswith("chapter_") and f.endswith(".xhtml")]
+
+    if len(epub_chapters) < len(canonical_toc):
+        shutil.rmtree(extract_dir, ignore_errors=True)
+        log_data.append("❌ Missing chapters detected in EPUB compared to live source.")
+        return "REDOWNLOAD", None
+
+    # --- STRICT WORD-FOR-WORD MAP ---
+    file_to_true_index = {}
+    seen_epub_titles = set()
+    
+    for chap_file in epub_chapters:
+        abs_chap_path = next((os.path.join(r, chap_file) for r, _, fs in os.walk(extract_dir) if chap_file in fs), None)
+        raw_title = extract_title_from_html(abs_chap_path)
+        cleaned_title = clean_text(raw_title)
+        
+        # EPUB Duplicate detection
+        if cleaned_title in seen_epub_titles:
             shutil.rmtree(extract_dir, ignore_errors=True)
-            if os.path.exists(epub_path): os.remove(epub_path)
-            log_data.append(f"❌ Scraping Error: {scrape_err}")
-            return "ERROR", f"Failed to scrape live TOC: {scrape_err}", log_data
-
-        if has_duplicates:
-            log_data.append("⚠️ Canonical TOC has duplicate chapter titles. Safe sorting is impossible.")
-            status = "REDOWNLOAD"
-            result = None
+            log_data.append(f"⚠️ Duplicate title found inside EPUB: '{raw_title}'. Cannot safely sort.")
+            return "REDOWNLOAD", None
+        seen_epub_titles.add(cleaned_title)
+        
+        if cleaned_title in canonical_toc:
+            file_to_true_index[chap_file] = canonical_toc[cleaned_title]
         else:
-            status, result = await loop.run_in_executor(self.executor, fix_epub_spine, epub_path, extract_dir, canonical_toc, log_data)
+            shutil.rmtree(extract_dir, ignore_errors=True)
+            log_data.append(f"⚠️ Exact title '{raw_title}' not found in live source TOC. Source may have changed.")
+            return "REDOWNLOAD", None
+
+    # --- 1. REORDER THE .OPF SPINE ---
+    opf_path = next((os.path.join(r, f) for r, _, fs in os.walk(extract_dir) for f in fs if f.endswith(".opf")), None)
+    with open(opf_path, 'r', encoding='utf-8') as f:
+        opf_soup = BeautifulSoup(f.read(), 'xml')
         
-        if status == "OK":
-            return "OK", epub_path, log_data
+    manifest = opf_soup.find('manifest')
+    id_to_href = {item.get('id'): item.get('href') for item in manifest.find_all('item') if item.get('id')}
 
-        if os.path.exists(epub_path): os.remove(epub_path)
-        
-        if status == "REDOWNLOAD" or status == "MISSING":
-            log_data.append("📥 Attempting fresh redownload via lncrawl...")
-            redownload_dir = os.path.join(TEMP_DIR, f"redownload_{msg.id}")
-            os.makedirs(redownload_dir, exist_ok=True)
-            new_epub = await loop.run_in_executor(self.executor, redownload_worker, url, redownload_dir)
-            
-            if new_epub:
-                log_data.append("✅ Redownload successful.")
-                return "REDOWNLOADED", new_epub, log_data
-            else:
-                log_data.append("❌ Redownload failed.")
-                return "ERROR", f"Failed to redownload {url}", log_data
-            
-        return status, result, log_data
-
-    async def run_streaming_loop(self, chat_id, source_chat, end_msg_id, bot):
-        status_msg = await bot.send_message(chat_id=chat_id, text="Initializing processing loop...")
-        loop = asyncio.get_running_loop()
-
-        await loop.run_in_executor(None, load_sources)
-
-        target = self.config["target_chat"]
-        t_ok = self.config["topic_ok"]
-        t_fixed = self.config["topic_fixed"]
-        t_re = self.config["topic_redownloaded"]
-        t_logs = self.config["topic_logs"]
-
-        success = 0
-        fixed = 0
-        redownloaded = 0
-        errors = 0
-
-        for chunk_start in range(1, end_msg_id + 1, 10):
-            chunk_end = min(chunk_start + 9, end_msg_id)
-            msg_ids = list(range(chunk_start, chunk_end + 1))
-
-            await status_msg.edit_text(
-                f"🔄 Processing IDs {chunk_start} to {chunk_end}...\n"
-                f"✅ OK: {success} | 🛠 Fixed: {fixed} | 📥 Redownloaded: {redownloaded} | ❌ Errors: {errors}"
-            )
-
-            try:
-                messages = await self.userbot.get_messages(source_chat, msg_ids)
-            except Exception as e:
-                await bot.send_message(chat_id=chat_id, text=f"❌ Userbot failed to fetch messages. Error: {e}")
-                return
-
-            valid_msgs = [m for m in messages if m and not m.empty and m.document and m.document.file_name.endswith('.epub')]
-            
-            if not valid_msgs:
-                continue
-
-            tasks = [self.process_single_epub(msg, loop) for msg in valid_msgs]
-            results = await asyncio.gather(*tasks)
-
-            for msg, (status, result, log_data) in zip(valid_msgs, results):
-                original_filename = msg.document.file_name
+    spine = opf_soup.find('spine')
+    itemrefs = spine.find_all('itemref')
+    
+    def sort_key(tag):
+        idref = tag.get('idref')
+        href = id_to_href.get(idref)
+        if href:
+            basename = os.path.basename(href.split('#')[0])
+            if basename in file_to_true_index: 
+                return (1, file_to_true_index[basename])
                 
-                # Construct and send the log receipt
-                log_text = f"📄 **File:** `{original_filename}`\n⚙️ **Status:** `{status}`\n"
-                log_text += "\n".join(log_data)
-                try:
-                    await bot.send_message(chat_id=target, text=log_text, message_thread_id=t_logs)
-                except Exception as e:
-                    logger.error(f"Failed to send log for {msg.id}: {e}")
+        if idref and idref.startswith('volume_'): 
+            vol_num = int(re.search(r'\d+', idref).group()) if re.search(r'\d+', idref) else 0
+            return (0, vol_num)
+            
+        return (-1, 0)
 
-                try:
-                    if status == "OK":
-                        final_path = os.path.join(TEMP_DIR, original_filename)
-                        os.rename(result, final_path)
-                        with open(final_path, 'rb') as f:
-                            await bot.send_document(chat_id=target, document=f, filename=original_filename, message_thread_id=t_ok)
-                        os.remove(final_path)
-                        success += 1
-                        
-                    elif status == "FIXED":
-                        final_path = os.path.join(TEMP_DIR, original_filename)
-                        os.rename(result, final_path)
-                        with open(final_path, 'rb') as f:
-                            await bot.send_document(chat_id=target, document=f, filename=original_filename, message_thread_id=t_fixed)
-                        os.remove(final_path)
-                        fixed += 1
-                        
-                    elif status == "REDOWNLOADED":
-                        # Original redownload keeps its native lncrawl name
-                        new_filename = os.path.basename(result)
-                        with open(result, 'rb') as f:
-                            await bot.send_document(chat_id=target, document=f, filename=new_filename, message_thread_id=t_re)
-                        shutil.rmtree(os.path.dirname(result), ignore_errors=True)
-                        redownloaded += 1
-                        
-                    elif status == "ERROR":
-                        errors += 1
-                except Exception as e:
-                    logger.error(f"Routing failed for {msg.id}: {e}")
+    sorted_itemrefs = sorted(itemrefs, key=sort_key)
+    
+    if itemrefs == sorted_itemrefs:
+        shutil.rmtree(extract_dir, ignore_errors=True)
+        log_data.append("✅ EPUB is perfectly synced with the live source. No changes needed.")
+        return "OK", None
 
-        await status_msg.edit_text(f"✅ Streaming Complete! Processed up to ID {end_msg_id}.")
+    spine.clear()
+    for item in sorted_itemrefs: spine.append(item)
 
-    def start(self):
-        print("🚀 Bot Starting (Strict Title Matching & Receipts)...")
-        app = Application.builder().token(TOKEN).post_init(self.post_init).post_stop(self.post_stop).build()
+    with open(opf_path, 'w', encoding='utf-8') as f:
+        f.write(str(opf_soup))
 
-        app.add_handler(CommandHandler("start", self.cmd_start))
-        app.add_handler(CommandHandler("setup", self.cmd_setup))
-        app.add_handler(CommandHandler("process", self.cmd_process))
+    # --- 2. REORDER THE TOC.NCX ---
+    ncx_path = next((os.path.join(r, f) for r, _, fs in os.walk(extract_dir) for f in fs if f.endswith(".ncx")), None)
+    if ncx_path:
+        with open(ncx_path, 'r', encoding='utf-8') as f:
+            ncx_soup = BeautifulSoup(f.read(), 'xml')
+        
+        navmap = ncx_soup.find('navMap')
+        if navmap:
+            navpoints = navmap.find_all('navPoint', recursive=False)
+            
+            def ncx_sort(tag):
+                content = tag.find('content')
+                src = content.get('src') if content else ''
+                basename = os.path.basename(src.split('#')[0])
+                return file_to_true_index.get(basename, 999999)
+                
+            sorted_navs = sorted(navpoints, key=ncx_sort)
+            navmap.clear()
+            for i, nav in enumerate(sorted_navs):
+                nav['playOrder'] = str(i + 1)
+                navmap.append(nav)
+                
+            with open(ncx_path, 'w', encoding='utf-8') as f:
+                f.write(str(ncx_soup))
 
-        app.run_polling()
+    # --- 3. REORDER THE TOC.XHTML ---
+    toc_xhtml = next((os.path.join(r, f) for r, _, fs in os.walk(extract_dir) for f in fs if f in ["toc.xhtml", "nav.xhtml"]), None)
+    if toc_xhtml:
+        with open(toc_xhtml, 'r', encoding='utf-8') as f:
+            toc_soup = BeautifulSoup(f.read(), 'html.parser')
+        
+        nav_list = toc_soup.find(['ol', 'ul'])
+        if nav_list:
+            items = nav_list.find_all('li', recursive=False)
+            
+            def toc_sort(tag):
+                a_tag = tag.find('a')
+                href = a_tag.get('href') if a_tag else ''
+                basename = os.path.basename(href.split('#')[0])
+                return file_to_true_index.get(basename, 999999)
+                
+            sorted_items = sorted(items, key=toc_sort)
+            nav_list.clear()
+            for item in sorted_items:
+                nav_list.append(item)
+                
+            with open(toc_xhtml, 'w', encoding='utf-8') as f:
+                f.write(str(toc_soup))
+        
+    fixed_epub_path = epub_path.replace('.epub', '_fixed.epub')
+    with zipfile.ZipFile(fixed_epub_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+        for r, _, fs in os.walk(extract_dir):
+            for file in fs:
+                abs_path = os.path.join(r, file)
+                zipf.write(abs_path, os.path.relpath(abs_path, extract_dir))
+                
+    shutil.rmtree(extract_dir, ignore_errors=True)
+    log_data.append(f"🛠️ Successfully mapped {len(epub_chapters)} chapters word-for-word. All Spines and TOCs rewritten.")
+    return "FIXED", fixed_epub_path
 
-if __name__ == "__main__":
-    multiprocessing.freeze_support()
-    healer = HealerBot()
-    healer.start()
+def redownload_worker(url, out_dir):
+    load_sources()
+    app = App()
+    try:
+        app.user_input = url
+        app.output_path = out_dir
+        app.pack_by_volume = False
+        app.output_formats = {'epub': True}
+        app.prepare_search()
+        app.get_novel_info()
+        for _ in app.start_download(): pass
+        for fmt, f in app.bind_books(): return f
+        return None
+    except Exception as e:
+        return None
+    finally:
+        app.destroy()
