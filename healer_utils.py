@@ -3,6 +3,7 @@ import re
 import zipfile
 import shutil
 import requests
+import difflib
 from requests.adapters import HTTPAdapter
 from bs4 import BeautifulSoup
 
@@ -33,7 +34,6 @@ def normalize_title(t):
     return re.sub(r'\W+', '', str(t)).lower()
 
 def extract_url_from_epub(epub_path):
-    """Unzips EPUB, reads intro.xhtml, returns URL, and leaves folder open for processing."""
     extract_dir = epub_path + "_unzipped"
     os.makedirs(extract_dir, exist_ok=True)
     
@@ -59,7 +59,6 @@ def extract_url_from_epub(epub_path):
     return match.group(1), extract_dir, None
 
 def fetch_live_toc(url):
-    """Scrapes the website on-the-fly for the canonical TOC."""
     app = App()
     try:
         app.user_input = url
@@ -84,13 +83,39 @@ def fetch_live_toc(url):
         app.destroy()
 
 def fix_epub_spine(epub_path, extract_dir, canonical_toc):
-    """Reads HTML titles, maps to canonical TOC, reorders spine, zips it up."""
     epub_chapters = [f for r, _, fs in os.walk(extract_dir) for f in fs if f.startswith("chapter_") and f.endswith(".xhtml")]
 
     if len(epub_chapters) < len(canonical_toc):
         shutil.rmtree(extract_dir, ignore_errors=True)
         return "MISSING", None
 
+    canonical_titles = list(canonical_toc.keys())
+
+    # --- MAP FILES TO TRUE INDEX USING HTML HEADING ---
+    file_to_true_index = {}
+    for chap_file in epub_chapters:
+        abs_chap_path = next((os.path.join(r, chap_file) for r, _, fs in os.walk(extract_dir) if chap_file in fs), None)
+        with open(abs_chap_path, 'r', encoding='utf-8') as f:
+            chap_soup = BeautifulSoup(f.read(), 'html.parser')
+            
+        # Check all headers to find the actual title, not the novel name
+        heading = chap_soup.find(['h1', 'h2', 'h3', 'h4'])
+        chap_title = heading.text.strip() if heading else ''
+            
+        norm = normalize_title(chap_title)
+        
+        if norm in canonical_toc:
+            file_to_true_index[chap_file] = canonical_toc[norm]
+        else:
+            # FUZZY MATCH: Allow for 70% similarity (catches "Chapter 1:" vs "Chapter 1")
+            matches = difflib.get_close_matches(norm, canonical_titles, n=1, cutoff=0.7)
+            if matches:
+                file_to_true_index[chap_file] = canonical_toc[matches[0]]
+            else:
+                fallback = int(re.search(r'\d+', chap_file).group()) if re.search(r'\d+', chap_file) else 0
+                file_to_true_index[chap_file] = 999999 + fallback
+
+    # --- 1. REORDER THE .OPF SPINE ---
     opf_path = next((os.path.join(r, f) for r, _, fs in os.walk(extract_dir) for f in fs if f.endswith(".opf")), None)
     with open(opf_path, 'r', encoding='utf-8') as f:
         opf_soup = BeautifulSoup(f.read(), 'xml')
@@ -98,29 +123,6 @@ def fix_epub_spine(epub_path, extract_dir, canonical_toc):
     manifest = opf_soup.find('manifest')
     id_to_href = {item.get('id'): item.get('href') for item in manifest.find_all('item') if item.get('id')}
 
-    # Match EPUB files to true index via Title
-    file_to_true_index = {}
-    for chap_file in epub_chapters:
-        abs_chap_path = next((os.path.join(r, chap_file) for r, _, fs in os.walk(extract_dir) if chap_file in fs), None)
-        with open(abs_chap_path, 'r', encoding='utf-8') as f:
-            chap_soup = BeautifulSoup(f.read(), 'html.parser')
-            
-        title_tag = chap_soup.find('title')
-        h1_tag = chap_soup.find('h1')
-        
-        chap_title = ""
-        if title_tag and title_tag.text.strip(): chap_title = title_tag.text.strip()
-        elif h1_tag and h1_tag.text.strip(): chap_title = h1_tag.text.strip()
-            
-        norm = normalize_title(chap_title)
-        
-        if norm in canonical_toc:
-            file_to_true_index[chap_file] = canonical_toc[norm]
-        else:
-            fallback_num = int(re.search(r'\d+', chap_file).group()) if re.search(r'\d+', chap_file) else 0
-            file_to_true_index[chap_file] = 999999 + fallback_num
-
-    # Reorder Spine
     spine = opf_soup.find('spine')
     itemrefs = spine.find_all('itemref')
     
@@ -134,7 +136,8 @@ def fix_epub_spine(epub_path, extract_dir, canonical_toc):
         return (-1, 0)
 
     sorted_itemrefs = sorted(itemrefs, key=sort_key)
-
+    
+    # If the spine is already perfectly ordered, skip processing
     if itemrefs == sorted_itemrefs:
         shutil.rmtree(extract_dir, ignore_errors=True)
         return "OK", None
@@ -144,6 +147,55 @@ def fix_epub_spine(epub_path, extract_dir, canonical_toc):
 
     with open(opf_path, 'w', encoding='utf-8') as f:
         f.write(str(opf_soup))
+
+    # --- 2. REORDER THE TOC.NCX (For E-Readers) ---
+    ncx_path = next((os.path.join(r, f) for r, _, fs in os.walk(extract_dir) for f in fs if f.endswith(".ncx")), None)
+    if ncx_path:
+        with open(ncx_path, 'r', encoding='utf-8') as f:
+            ncx_soup = BeautifulSoup(f.read(), 'xml')
+        
+        navmap = ncx_soup.find('navMap')
+        if navmap:
+            navpoints = navmap.find_all('navPoint', recursive=False)
+            
+            def ncx_sort(tag):
+                content = tag.find('content')
+                src = content.get('src') if content else ''
+                src_clean = src.split('#')[0] # Remove anchors
+                return file_to_true_index.get(src_clean, 999999)
+                
+            sorted_navs = sorted(navpoints, key=ncx_sort)
+            navmap.clear()
+            for i, nav in enumerate(sorted_navs):
+                nav['playOrder'] = str(i + 1) # Repair play orders sequentially
+                navmap.append(nav)
+                
+            with open(ncx_path, 'w', encoding='utf-8') as f:
+                f.write(str(ncx_soup))
+
+    # --- 3. REORDER THE TOC.XHTML (For Web Readers) ---
+    toc_xhtml = next((os.path.join(r, f) for r, _, fs in os.walk(extract_dir) for f in fs if f in ["toc.xhtml", "nav.xhtml"]), None)
+    if toc_xhtml:
+        with open(toc_xhtml, 'r', encoding='utf-8') as f:
+            toc_soup = BeautifulSoup(f.read(), 'html.parser')
+        
+        nav_list = toc_soup.find(['ol', 'ul'])
+        if nav_list:
+            items = nav_list.find_all('li', recursive=False)
+            
+            def toc_sort(tag):
+                a_tag = tag.find('a')
+                href = a_tag.get('href') if a_tag else ''
+                href_clean = href.split('#')[0]
+                return file_to_true_index.get(href_clean, 999999)
+                
+            sorted_items = sorted(items, key=toc_sort)
+            nav_list.clear()
+            for item in sorted_items:
+                nav_list.append(item)
+                
+            with open(toc_xhtml, 'w', encoding='utf-8') as f:
+                f.write(str(toc_soup))
         
     fixed_epub_path = epub_path.replace('.epub', '_fixed.epub')
     with zipfile.ZipFile(fixed_epub_path, 'w', zipfile.ZIP_DEFLATED) as zipf:

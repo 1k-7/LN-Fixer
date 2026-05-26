@@ -76,7 +76,6 @@ class HealerBot:
             target_chat = int(context.args[0])
             status_msg = await update.message.reply_text(f"⚙️ Initializing Forum Topics via standard Bot API...")
             
-            # Use the Standard Bot API to create topics
             topic_ok = await context.bot.create_forum_topic(chat_id=target_chat, name="✅ NO Changes")
             topic_fixed = await context.bot.create_forum_topic(chat_id=target_chat, name="🛠 FIXED")
             topic_redownload = await context.bot.create_forum_topic(chat_id=target_chat, name="📥 Redownloaded")
@@ -89,7 +88,7 @@ class HealerBot:
             }
             
             with open(CONFIG_FILE, 'w') as f:
-                json.dump(self.config, f) # Corrected from json.load
+                json.dump(self.config, f) 
                 
             await status_msg.edit_text("✅ Topics created and saved successfully! Send `/process <message_link>` to begin.")
             
@@ -120,9 +119,7 @@ class HealerBot:
         asyncio.create_task(self.run_streaming_loop(update.effective_chat.id, source_chat, end_msg_id, context.bot))
 
     async def process_single_epub(self, msg, loop):
-        """Pipeline for a single EPUB file"""
         epub_path = os.path.join(TEMP_DIR, f"{msg.id}.epub")
-        # Userbot strictly handles downloading the historical file
         await msg.download(file_name=epub_path)
 
         url, extract_dir, err = await loop.run_in_executor(self.executor, extract_url_from_epub, epub_path)
@@ -138,11 +135,9 @@ class HealerBot:
 
         status, result = await loop.run_in_executor(self.executor, fix_epub_spine, epub_path, extract_dir, canonical_toc)
         
-        # If it was completely perfect, we return the original epub path to upload
         if status == "OK":
             return "OK", epub_path
 
-        # Otherwise, clean up the original epub, we are using the new result
         if os.path.exists(epub_path): os.remove(epub_path)
         
         if status == "MISSING":
@@ -171,7 +166,6 @@ class HealerBot:
         redownloaded = 0
         errors = 0
 
-        # Max 10 concurrent scrapes to pace FanMTL properly
         for chunk_start in range(1, end_msg_id + 1, 10):
             chunk_end = min(chunk_start + 9, end_msg_id)
             msg_ids = list(range(chunk_start, chunk_end + 1))
@@ -182,7 +176,6 @@ class HealerBot:
             )
 
             try:
-                # Userbot pulls the data
                 messages = await self.userbot.get_messages(source_chat, msg_ids)
             except Exception as e:
                 await bot.send_message(chat_id=chat_id, text=f"❌ Userbot failed to fetch messages. Error: {e}")
@@ -196,22 +189,34 @@ class HealerBot:
             tasks = [self.process_single_epub(msg, loop) for msg in valid_msgs]
             results = await asyncio.gather(*tasks)
 
-            # Standard Bot handles the uploading and routing
             for msg, (status, result) in zip(valid_msgs, results):
                 try:
+                    original_filename = msg.document.file_name
+                    
                     if status == "OK":
-                        with open(result, 'rb') as f:
+                        # Ensure the file physically bears the correct original name
+                        final_path = os.path.join(TEMP_DIR, original_filename)
+                        os.rename(result, final_path)
+                        with open(final_path, 'rb') as f:
                             await bot.send_document(chat_id=target, document=f, message_thread_id=t_ok)
-                        os.remove(result)
+                        os.remove(final_path)
                         success += 1
                         
                     elif status == "FIXED":
-                        with open(result, 'rb') as f:
+                        # Physically rename the file to include [Fixed]
+                        base, ext = os.path.splitext(original_filename)
+                        if not ext: ext = ".epub"
+                        fixed_filename = f"{base} [Fixed]{ext}"
+                        
+                        final_path = os.path.join(TEMP_DIR, fixed_filename)
+                        os.rename(result, final_path)
+                        with open(final_path, 'rb') as f:
                             await bot.send_document(chat_id=target, document=f, message_thread_id=t_fixed)
-                        os.remove(result)
+                        os.remove(final_path)
                         fixed += 1
                         
                     elif status == "REDOWNLOADED":
+                        # Original redownload keeps its native lncrawl name
                         with open(result, 'rb') as f:
                             await bot.send_document(chat_id=target, document=f, message_thread_id=t_re)
                         shutil.rmtree(os.path.dirname(result), ignore_errors=True)
@@ -226,7 +231,7 @@ class HealerBot:
         await status_msg.edit_text(f"✅ Streaming Complete! Processed up to ID {end_msg_id}.")
 
     def start(self):
-        print("🚀 Bot Starting (On-Demand Streaming Architecture)...")
+        print("🚀 Bot Starting (With Physical Renaming & Deep Spine Fixes)...")
         app = Application.builder().token(TOKEN).post_init(self.post_init).post_stop(self.post_stop).build()
 
         app.add_handler(CommandHandler("start", self.cmd_start))
