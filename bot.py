@@ -135,7 +135,6 @@ class HealerBot:
         asyncio.create_task(self.run_streaming_loop(update.effective_chat.id, source_chat, end_msg_id, context.bot))
 
     async def status_updater(self, status_msg, stats, end_msg_id):
-        """Continuously updates the Telegram UI every 5 seconds without blocking the pipeline."""
         while True:
             try:
                 queue_remaining = stats.total_found - stats.processed
@@ -151,33 +150,42 @@ class HealerBot:
             await asyncio.sleep(5)
 
     async def process_single_epub(self, msg, loop):
-        """The core processing logic (unchanged)"""
         log_data = []
         original_filename = msg.document.file_name
         epub_path = os.path.join(ABS_TEMP_DIR, f"{msg.id}.epub")
         
-        # --- 1. SAFE THROTTLED DOWNLOAD ---
-        async with self.download_semaphore:
-            try:
-                actual_path = await msg.download(file_name=epub_path)
-                if actual_path:
-                    epub_path = actual_path
-            except Exception as e:
-                log_data.append(f"❌ Pyrogram Download Exception: {e}")
-                return "ERROR", "Download Failed", log_data
+        # --- 1. ACTIVE RETRY DOWNLOAD LOOP ---
+        MAX_RETRIES = 3
+        download_success = False
+        
+        for attempt in range(MAX_RETRIES):
+            async with self.download_semaphore:
+                try:
+                    actual_path = await msg.download(file_name=epub_path)
+                    if actual_path:
+                        epub_path = actual_path
+                except Exception as e:
+                    logger.warning(f"Download attempt {attempt + 1} failed for {original_filename}: {e}")
 
-        # --- 2. INTEGRITY CHECK ---
-        if not os.path.exists(epub_path):
-            log_data.append("❌ File missing completely after download step.")
-            return "ERROR", "File Missing", log_data
+            # INTEGRITY CHECK
+            if os.path.exists(epub_path):
+                file_size = os.path.getsize(epub_path)
+                if file_size >= 1024: 
+                    download_success = True
+                    break # Success! Break out of the retry loop.
+                else:
+                    # It's a 0-byte or corrupted file. Delete it immediately.
+                    os.remove(epub_path)
+                    logger.warning(f"0-byte file detected for {original_filename}. Attempt {attempt + 1} of {MAX_RETRIES}.")
             
-        file_size = os.path.getsize(epub_path)
-        if file_size < 1024: 
-            os.remove(epub_path)
-            log_data.append(f"❌ Network drop detected. Downloaded file is only {file_size} bytes (corrupted).")
+            # Exponential Backoff before retrying (Wait 2s, then 4s, etc.)
+            await asyncio.sleep(2 * (attempt + 1))
+            
+        if not download_success:
+            log_data.append(f"❌ Network drop detected. Failed to download a valid file after {MAX_RETRIES} attempts.")
             return "ERROR", "Corrupt Empty File", log_data
 
-        # --- 3. STANDARD LOGIC ---
+        # --- 2. STANDARD LOGIC ---
         url, extract_dir, err = await loop.run_in_executor(self.executor, extract_url_from_epub, epub_path)
         if err:
             if os.path.exists(epub_path): os.remove(epub_path)
@@ -221,7 +229,6 @@ class HealerBot:
         return status, result, log_data
 
     async def worker(self, queue, target, t_ok, t_fixed, t_re, t_logs, bot, loop, stats):
-        """Consumer Worker: Pulls files off the conveyor belt endlessly until done."""
         while True:
             msg = await queue.get()
             try:
@@ -279,16 +286,13 @@ class HealerBot:
         stats = PipelineStats()
         epub_queue = asyncio.Queue()
 
-        # START THE CONSUMERS (4 concurrent workers to maximize CPU & Network)
         workers = [
             asyncio.create_task(self.worker(epub_queue, target, t_ok, t_fixed, t_re, t_logs, bot, loop, stats))
             for _ in range(4)
         ]
 
-        # START THE UI UPDATER
         updater_task = asyncio.create_task(self.status_updater(status_msg, stats, end_msg_id))
 
-        # START THE PRODUCER (Fetch massive chunks of 100 instantly, dump to queue)
         for chunk_start in range(1, end_msg_id + 1, 100):
             chunk_end = min(chunk_start + 99, end_msg_id)
             msg_ids = list(range(chunk_start, chunk_end + 1))
@@ -298,15 +302,13 @@ class HealerBot:
                 valid_msgs = [m for m in messages if m and m.document and m.document.file_name and m.document.file_name.endswith('.epub')]
                 for m in valid_msgs:
                     stats.total_found += 1
-                    await epub_queue.put(m) # Throw onto the conveyor belt
+                    await epub_queue.put(m)
             except Exception as e:
                 logger.error(f"❌ Userbot failed to fetch messages for ids {chunk_start}-{chunk_end}. Error: {e}")
                 await asyncio.sleep(5) 
 
-        # Wait until the conveyor belt is completely empty and finished
         await epub_queue.join()
 
-        # Shutdown Background Tasks
         for w in workers:
             w.cancel()
         updater_task.cancel()
@@ -319,7 +321,7 @@ class HealerBot:
         )
 
     def start(self):
-        print("🚀 Bot Starting (Continuous Queue Pipeline Enabled)...")
+        print("🚀 Bot Starting (Download Retries Enabled)...")
         app = Application.builder().token(TOKEN).post_init(self.post_init).post_stop(self.post_stop).build()
 
         app.add_handler(CommandHandler("start", self.cmd_start))
