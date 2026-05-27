@@ -7,7 +7,7 @@ import multiprocessing
 from concurrent.futures import ProcessPoolExecutor
 
 from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+from telegram.ext import Application, CommandHandler, ContextTypes
 from pyrogram import Client as UserBotClient
 
 from lncrawl.core.sources import load_sources 
@@ -25,14 +25,19 @@ SESSION_STRING = os.getenv("SESSION_STRING")
 DATA_DIR = "data"
 TEMP_DIR = "temp_epubs"
 CONFIG_FILE = os.path.join(DATA_DIR, "config.json")
+
+# Force absolute paths to prevent Pyrogram from sneaking files into a default "downloads/" folder
+ABS_TEMP_DIR = os.path.abspath(TEMP_DIR)
 os.makedirs(DATA_DIR, exist_ok=True)
-os.makedirs(TEMP_DIR, exist_ok=True)
+os.makedirs(ABS_TEMP_DIR, exist_ok=True)
 
 class HealerBot:
     def __init__(self):
         self.executor = None
         self.userbot = None
         self.config = {}
+        # THE FIX: Throttle Pyrogram downloads to 2 at a time to prevent Telegram MTProto DC connection drops.
+        self.download_semaphore = asyncio.Semaphore(2)
 
     async def post_init(self, application: Application):
         self.executor = ProcessPoolExecutor(max_workers=4)
@@ -123,9 +128,30 @@ class HealerBot:
     async def process_single_epub(self, msg, loop):
         log_data = []
         original_filename = msg.document.file_name
-        epub_path = os.path.join(TEMP_DIR, f"{msg.id}.epub")
-        await msg.download(file_name=epub_path)
+        epub_path = os.path.join(ABS_TEMP_DIR, f"{msg.id}.epub")
+        
+        # --- 1. SAFE THROTTLED DOWNLOAD ---
+        async with self.download_semaphore:
+            try:
+                actual_path = await msg.download(file_name=epub_path)
+                if actual_path:
+                    epub_path = actual_path
+            except Exception as e:
+                log_data.append(f"❌ Pyrogram Download Exception: {e}")
+                return "ERROR", "Download Failed", log_data
 
+        # --- 2. INTEGRITY CHECK (Defeats the 0-byte Bad Zip File Bug) ---
+        if not os.path.exists(epub_path):
+            log_data.append("❌ File missing completely after download step.")
+            return "ERROR", "File Missing", log_data
+            
+        file_size = os.path.getsize(epub_path)
+        if file_size < 1024:  # If it's less than 1KB, Telegram dropped the connection.
+            os.remove(epub_path)
+            log_data.append(f"❌ Network drop detected. Downloaded file is only {file_size} bytes (corrupted).")
+            return "ERROR", "Corrupt Empty File", log_data
+
+        # --- 3. STANDARD LOGIC ---
         url, extract_dir, err = await loop.run_in_executor(self.executor, extract_url_from_epub, epub_path)
         if err:
             if os.path.exists(epub_path): os.remove(epub_path)
@@ -155,7 +181,7 @@ class HealerBot:
         
         if status in ("REDOWNLOAD", "MISSING"):
             log_data.append("📥 Attempting fresh redownload natively (using patched sequential scraper)...")
-            redownload_dir = os.path.join(TEMP_DIR, f"redownload_{msg.id}")
+            redownload_dir = os.path.join(ABS_TEMP_DIR, f"redownload_{msg.id}")
             os.makedirs(redownload_dir, exist_ok=True)
             new_epub = await loop.run_in_executor(self.executor, redownload_worker, url, redownload_dir)
             
@@ -242,7 +268,7 @@ class HealerBot:
         await status_msg.edit_text(f"✅ Streaming Complete! Processed up to ID {end_msg_id}.")
 
     def start(self):
-        print("🚀 Bot Starting (With Deep Runtime FanMTL Monkey-Patch)...")
+        print("🚀 Bot Starting (Download Throttling Enabled)...")
         app = Application.builder().token(TOKEN).post_init(self.post_init).post_stop(self.post_stop).build()
 
         app.add_handler(CommandHandler("start", self.cmd_start))

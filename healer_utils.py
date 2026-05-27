@@ -36,10 +36,6 @@ SHARED_SESSION.mount('https://', adapter)
 # -------------------------------------
 
 def apply_fanmtl_patch():
-    """
-    Injected per-process to guarantee the ProcessPoolExecutor doesn't lose the patch.
-    Forces FanMTL to scrape SYNCHRONOUSLY. Zero guesswork. Zero async race conditions.
-    """
     try:
         from lncrawl.sources.en.f.fanmtl import FanMTLCrawler
         if getattr(FanMTLCrawler, '_is_healer_patched', False):
@@ -94,11 +90,10 @@ def apply_fanmtl_patch():
         pass
 
 def clean_text(text):
-    """Aggressive normalization: Removes colons, punctuation, and non-breaking spaces."""
     if not text: return ""
     decoded = html.unescape(str(text))
     normalized = unicodedata.normalize('NFKD', decoded)
-    alphanumeric = re.sub(r'[^a-zA-Z0-9\s]', '', normalized) # strips punctuation
+    alphanumeric = re.sub(r'[^a-zA-Z0-9\s]', '', normalized)
     return " ".join(alphanumeric.lower().split())
 
 def extract_url_from_epub(epub_path):
@@ -110,7 +105,10 @@ def extract_url_from_epub(epub_path):
             zip_ref.extractall(extract_dir)
     except zipfile.BadZipFile:
         shutil.rmtree(extract_dir, ignore_errors=True)
-        return None, extract_dir, "Bad Zip File"
+        return None, extract_dir, "Bad Zip File (Likely 0 bytes / Interrupted download)"
+    except Exception as e:
+        shutil.rmtree(extract_dir, ignore_errors=True)
+        return None, extract_dir, f"Zip Extraction Crash: {str(e)}"
 
     intro_path = next((os.path.join(r, f) for r, _, fs in os.walk(extract_dir) for f in fs if f == "intro.xhtml"), None)
     if not intro_path:
@@ -127,7 +125,7 @@ def extract_url_from_epub(epub_path):
     return match.group(1), extract_dir, None
 
 def fetch_live_toc(url):
-    apply_fanmtl_patch() # Inject into process
+    apply_fanmtl_patch()
     app = App()
     try:
         app.user_input = url
@@ -187,7 +185,7 @@ def fix_epub_spine(epub_path, extract_dir, canonical_toc, log_data):
             log_data.append(f"⚠️ Exact title '{raw_title}' not found in live source TOC.")
             return "REDOWNLOAD", None
 
-    # --- 1. REORDER OPF SPINE (Flat structure) ---
+    # --- 1. REORDER OPF SPINE ---
     opf_path = next((os.path.join(r, f) for r, _, fs in os.walk(extract_dir) for f in fs if f.endswith(".opf")), None)
     with open(opf_path, 'r', encoding='utf-8') as f:
         opf_soup = BeautifulSoup(f.read(), 'xml')
@@ -215,7 +213,7 @@ def fix_epub_spine(epub_path, extract_dir, canonical_toc, log_data):
     with open(opf_path, 'w', encoding='utf-8') as f:
         f.write(str(opf_soup))
 
-    # --- 2. REORDER NCX (Recursive to penetrate 'Volume' tags) ---
+    # --- 2. REORDER NCX ---
     ncx_path = next((os.path.join(r, f) for r, _, fs in os.walk(extract_dir) for f in fs if f.endswith(".ncx")), None)
     if ncx_path:
         with open(ncx_path, 'r', encoding='utf-8') as f:
@@ -226,9 +224,7 @@ def fix_epub_spine(epub_path, extract_dir, canonical_toc, log_data):
             def sort_ncx_recursive(container):
                 navpoints = container.find_all('navPoint', recursive=False)
                 if not navpoints: return
-                
-                for np in navpoints:
-                    sort_ncx_recursive(np)
+                for np in navpoints: sort_ncx_recursive(np)
                     
                 def get_idx(np):
                     content = np.find('content')
@@ -246,14 +242,13 @@ def fix_epub_spine(epub_path, extract_dir, canonical_toc, log_data):
 
             sort_ncx_recursive(navmap)
             
-            # Rewrite global playOrder explicitly
             for i, np in enumerate(ncx_soup.find_all('navPoint')):
                 np['playOrder'] = str(i + 1)
                 
             with open(ncx_path, 'w', encoding='utf-8') as f:
                 f.write(str(ncx_soup))
 
-    # --- 3. REORDER TOC.XHTML (Recursive to penetrate Lists) ---
+    # --- 3. REORDER TOC.XHTML ---
     toc_xhtml = next((os.path.join(r, f) for r, _, fs in os.walk(extract_dir) for f in fs if f in ["toc.xhtml", "nav.xhtml"]), None)
     if toc_xhtml:
         with open(toc_xhtml, 'r', encoding='utf-8') as f:
@@ -284,7 +279,6 @@ def fix_epub_spine(epub_path, extract_dir, canonical_toc, log_data):
                 for li in sorted_items: container.append(li)
 
             sort_html_recursive(nav_list)
-            
             with open(toc_xhtml, 'w', encoding='utf-8') as f:
                 f.write(str(toc_soup))
         
@@ -296,8 +290,7 @@ def fix_epub_spine(epub_path, extract_dir, canonical_toc, log_data):
             
         for r, _, fs in os.walk(extract_dir):
             for file in fs:
-                if file == 'mimetype' and r == extract_dir:
-                    continue 
+                if file == 'mimetype' and r == extract_dir: continue 
                 abs_path = os.path.join(r, file)
                 zipf.write(abs_path, os.path.relpath(abs_path, extract_dir), compress_type=zipfile.ZIP_DEFLATED)
                 
@@ -306,7 +299,7 @@ def fix_epub_spine(epub_path, extract_dir, canonical_toc, log_data):
     return "FIXED", fixed_epub_path
 
 def redownload_worker(url, out_dir):
-    apply_fanmtl_patch() # Inject into process
+    apply_fanmtl_patch()
     load_sources()
     app = App()
     try:
