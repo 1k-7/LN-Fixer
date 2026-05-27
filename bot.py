@@ -31,12 +31,21 @@ ABS_TEMP_DIR = os.path.abspath(TEMP_DIR)
 os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(ABS_TEMP_DIR, exist_ok=True)
 
+class PipelineStats:
+    def __init__(self):
+        self.processed = 0
+        self.success = 0
+        self.fixed = 0
+        self.redownloaded = 0
+        self.errors = 0
+        self.total_found = 0
+
 class HealerBot:
     def __init__(self):
         self.executor = None
         self.userbot = None
         self.config = {}
-        # THE FIX: Throttle Pyrogram downloads to 2 at a time to prevent Telegram MTProto DC connection drops.
+        # Protects Telegram MTProto from concurrent download connection drops
         self.download_semaphore = asyncio.Semaphore(2)
 
     async def post_init(self, application: Application):
@@ -68,7 +77,7 @@ class HealerBot:
 
     async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
-            "🛠 **LN EPUB On-Demand Healer Ready**\n\n"
+            "🛠 **LN EPUB Continuous Pipeline Ready**\n\n"
             "1. Send `/setup <supergroup_id>` to initialize Topics.\n"
             "2. Send `/process <message_link>` to start parsing."
         )
@@ -122,10 +131,27 @@ class HealerBot:
         except Exception:
             return await update.message.reply_text("⚠️ Invalid message link format.")
 
-        await update.message.reply_text(f"🚀 Streaming Engine Started!\nSource: `{source_chat}`\nTarget ID: `1` to `{end_msg_id}`")
+        await update.message.reply_text(f"🚀 Continuous Pipeline Started!\nSource: `{source_chat}`\nTarget ID: `1` to `{end_msg_id}`")
         asyncio.create_task(self.run_streaming_loop(update.effective_chat.id, source_chat, end_msg_id, context.bot))
 
+    async def status_updater(self, status_msg, stats, end_msg_id):
+        """Continuously updates the Telegram UI every 5 seconds without blocking the pipeline."""
+        while True:
+            try:
+                queue_remaining = stats.total_found - stats.processed
+                await status_msg.edit_text(
+                    f"🔄 **Pipeline Active (Zero-Delay)**\n"
+                    f"Found {stats.total_found} valid EPUBs up to ID {end_msg_id}.\n\n"
+                    f"✅ OK: {stats.success} | 🛠 Fixed: {stats.fixed}\n"
+                    f"📥 Redownloaded: {stats.redownloaded} | ❌ Errors: {stats.errors}\n\n"
+                    f"⚙️ Conveyor Belt: `{queue_remaining}` files remaining..."
+                )
+            except Exception:
+                pass
+            await asyncio.sleep(5)
+
     async def process_single_epub(self, msg, loop):
+        """The core processing logic (unchanged)"""
         log_data = []
         original_filename = msg.document.file_name
         epub_path = os.path.join(ABS_TEMP_DIR, f"{msg.id}.epub")
@@ -140,13 +166,13 @@ class HealerBot:
                 log_data.append(f"❌ Pyrogram Download Exception: {e}")
                 return "ERROR", "Download Failed", log_data
 
-        # --- 2. INTEGRITY CHECK (Defeats the 0-byte Bad Zip File Bug) ---
+        # --- 2. INTEGRITY CHECK ---
         if not os.path.exists(epub_path):
             log_data.append("❌ File missing completely after download step.")
             return "ERROR", "File Missing", log_data
             
         file_size = os.path.getsize(epub_path)
-        if file_size < 1024:  # If it's less than 1KB, Telegram dropped the connection.
+        if file_size < 1024: 
             os.remove(epub_path)
             log_data.append(f"❌ Network drop detected. Downloaded file is only {file_size} bytes (corrupted).")
             return "ERROR", "Corrupt Empty File", log_data
@@ -194,45 +220,12 @@ class HealerBot:
             
         return status, result, log_data
 
-    async def run_streaming_loop(self, chat_id, source_chat, end_msg_id, bot):
-        status_msg = await bot.send_message(chat_id=chat_id, text="Initializing processing loop...")
-        loop = asyncio.get_running_loop()
-
-        await loop.run_in_executor(None, load_sources)
-
-        target = self.config["target_chat"]
-        t_ok = self.config["topic_ok"]
-        t_fixed = self.config["topic_fixed"]
-        t_re = self.config["topic_redownloaded"]
-        t_logs = self.config["topic_logs"]
-
-        success, fixed, redownloaded, errors = 0, 0, 0, 0
-
-        for chunk_start in range(1, end_msg_id + 1, 10):
-            chunk_end = min(chunk_start + 9, end_msg_id)
-            msg_ids = list(range(chunk_start, chunk_end + 1))
-
-            await status_msg.edit_text(
-                f"🔄 Processing IDs {chunk_start} to {chunk_end}...\n"
-                f"✅ OK: {success} | 🛠 Fixed: {fixed} | 📥 Redownloaded: {redownloaded} | ❌ Errors: {errors}"
-            )
-
+    async def worker(self, queue, target, t_ok, t_fixed, t_re, t_logs, bot, loop, stats):
+        """Consumer Worker: Pulls files off the conveyor belt endlessly until done."""
+        while True:
+            msg = await queue.get()
             try:
-                messages = await self.userbot.get_messages(source_chat, msg_ids)
-            except Exception as e:
-                logger.error(f"❌ Userbot failed to fetch messages for ids {chunk_start}-{chunk_end}. Error: {e}")
-                await asyncio.sleep(5) 
-                continue
-
-            valid_msgs = [m for m in messages if m and m.document and m.document.file_name and m.document.file_name.endswith('.epub')]
-            
-            if not valid_msgs:
-                continue
-
-            tasks = [self.process_single_epub(msg, loop) for msg in valid_msgs]
-            results = await asyncio.gather(*tasks)
-
-            for msg, (status, result, log_data) in zip(valid_msgs, results):
+                status, result, log_data = await self.process_single_epub(msg, loop)
                 original_filename = msg.document.file_name
                 
                 log_text = f"📄 **File:** `{original_filename}`\n⚙️ **Status:** `{status}`\n" + "\n".join(log_data)
@@ -246,29 +239,87 @@ class HealerBot:
                         with open(result, 'rb') as f:
                             await bot.send_document(chat_id=target, document=f, filename=original_filename, message_thread_id=t_ok)
                         os.remove(result)
-                        success += 1
+                        stats.success += 1
                         
                     elif status == "FIXED":
                         with open(result, 'rb') as f:
                             await bot.send_document(chat_id=target, document=f, filename=original_filename, message_thread_id=t_fixed)
                         os.remove(result)
-                        fixed += 1
+                        stats.fixed += 1
                         
                     elif status == "REDOWNLOADED":
                         with open(result, 'rb') as f:
                             await bot.send_document(chat_id=target, document=f, filename=original_filename, message_thread_id=t_re)
                         shutil.rmtree(os.path.dirname(result), ignore_errors=True)
-                        redownloaded += 1
+                        stats.redownloaded += 1
                         
                     elif status == "ERROR":
-                        errors += 1
+                        stats.errors += 1
                 except Exception as e:
                     logger.error(f"Routing failed for {msg.id}: {e}")
+                    stats.errors += 1
+            except Exception as e:
+                logger.error(f"Worker exception on msg {msg.id}: {e}")
+                stats.errors += 1
+            finally:
+                stats.processed += 1
+                queue.task_done()
 
-        await status_msg.edit_text(f"✅ Streaming Complete! Processed up to ID {end_msg_id}.")
+    async def run_streaming_loop(self, chat_id, source_chat, end_msg_id, bot):
+        status_msg = await bot.send_message(chat_id=chat_id, text="Spinning up Continuous Pipeline...")
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, load_sources)
+
+        target = self.config["target_chat"]
+        t_ok = self.config["topic_ok"]
+        t_fixed = self.config["topic_fixed"]
+        t_re = self.config["topic_redownloaded"]
+        t_logs = self.config["topic_logs"]
+
+        stats = PipelineStats()
+        epub_queue = asyncio.Queue()
+
+        # START THE CONSUMERS (4 concurrent workers to maximize CPU & Network)
+        workers = [
+            asyncio.create_task(self.worker(epub_queue, target, t_ok, t_fixed, t_re, t_logs, bot, loop, stats))
+            for _ in range(4)
+        ]
+
+        # START THE UI UPDATER
+        updater_task = asyncio.create_task(self.status_updater(status_msg, stats, end_msg_id))
+
+        # START THE PRODUCER (Fetch massive chunks of 100 instantly, dump to queue)
+        for chunk_start in range(1, end_msg_id + 1, 100):
+            chunk_end = min(chunk_start + 99, end_msg_id)
+            msg_ids = list(range(chunk_start, chunk_end + 1))
+
+            try:
+                messages = await self.userbot.get_messages(source_chat, msg_ids)
+                valid_msgs = [m for m in messages if m and m.document and m.document.file_name and m.document.file_name.endswith('.epub')]
+                for m in valid_msgs:
+                    stats.total_found += 1
+                    await epub_queue.put(m) # Throw onto the conveyor belt
+            except Exception as e:
+                logger.error(f"❌ Userbot failed to fetch messages for ids {chunk_start}-{chunk_end}. Error: {e}")
+                await asyncio.sleep(5) 
+
+        # Wait until the conveyor belt is completely empty and finished
+        await epub_queue.join()
+
+        # Shutdown Background Tasks
+        for w in workers:
+            w.cancel()
+        updater_task.cancel()
+
+        await status_msg.edit_text(
+            f"✅ **Pipeline Complete!**\n\n"
+            f"Processed {stats.total_found} valid EPUBs up to ID {end_msg_id}.\n"
+            f"✅ OK: {stats.success} | 🛠 Fixed: {stats.fixed}\n"
+            f"📥 Redownloaded: {stats.redownloaded} | ❌ Errors: {stats.errors}"
+        )
 
     def start(self):
-        print("🚀 Bot Starting (Download Throttling Enabled)...")
+        print("🚀 Bot Starting (Continuous Queue Pipeline Enabled)...")
         app = Application.builder().token(TOKEN).post_init(self.post_init).post_stop(self.post_stop).build()
 
         app.add_handler(CommandHandler("start", self.cmd_start))
