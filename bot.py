@@ -121,7 +121,6 @@ class HealerBot:
         asyncio.create_task(self.run_streaming_loop(update.effective_chat.id, source_chat, end_msg_id, context.bot))
 
     async def process_single_epub(self, msg, loop):
-        """Pipeline for a single EPUB file"""
         log_data = []
         original_filename = msg.document.file_name
         epub_path = os.path.join(TEMP_DIR, f"{msg.id}.epub")
@@ -154,7 +153,7 @@ class HealerBot:
 
         if os.path.exists(epub_path): os.remove(epub_path)
         
-        if status == "REDOWNLOAD" or status == "MISSING":
+        if status in ("REDOWNLOAD", "MISSING"):
             log_data.append("📥 Attempting fresh redownload via lncrawl...")
             redownload_dir = os.path.join(TEMP_DIR, f"redownload_{msg.id}")
             os.makedirs(redownload_dir, exist_ok=True)
@@ -181,10 +180,7 @@ class HealerBot:
         t_re = self.config["topic_redownloaded"]
         t_logs = self.config["topic_logs"]
 
-        success = 0
-        fixed = 0
-        redownloaded = 0
-        errors = 0
+        success, fixed, redownloaded, errors = 0, 0, 0, 0
 
         for chunk_start in range(1, end_msg_id + 1, 10):
             chunk_end = min(chunk_start + 9, end_msg_id)
@@ -198,10 +194,11 @@ class HealerBot:
             try:
                 messages = await self.userbot.get_messages(source_chat, msg_ids)
             except Exception as e:
-                await bot.send_message(chat_id=chat_id, text=f"❌ Userbot failed to fetch messages. Error: {e}")
-                return
+                logger.error(f"❌ Userbot failed to fetch messages for ids {chunk_start}-{chunk_end}. Error: {e}")
+                await asyncio.sleep(5) 
+                continue # Do not kill stream, attempt to recover on next chunk
 
-            valid_msgs = [m for m in messages if m and not m.empty and m.document and m.document.file_name.endswith('.epub')]
+            valid_msgs = [m for m in messages if m and m.document and m.document.file_name and m.document.file_name.endswith('.epub')]
             
             if not valid_msgs:
                 continue
@@ -212,36 +209,30 @@ class HealerBot:
             for msg, (status, result, log_data) in zip(valid_msgs, results):
                 original_filename = msg.document.file_name
                 
-                # Construct and send the log receipt
-                log_text = f"📄 **File:** `{original_filename}`\n⚙️ **Status:** `{status}`\n"
-                log_text += "\n".join(log_data)
+                log_text = f"📄 **File:** `{original_filename}`\n⚙️ **Status:** `{status}`\n" + "\n".join(log_data)
                 try:
                     await bot.send_message(chat_id=target, text=log_text, message_thread_id=t_logs)
                 except Exception as e:
                     logger.error(f"Failed to send log for {msg.id}: {e}")
 
+                # Safely send directly using the underlying f-handle faking original_filename 
+                # This explicitly avoids temp directory file overwrite collisions between threads
                 try:
                     if status == "OK":
-                        final_path = os.path.join(TEMP_DIR, original_filename)
-                        os.rename(result, final_path)
-                        with open(final_path, 'rb') as f:
+                        with open(result, 'rb') as f:
                             await bot.send_document(chat_id=target, document=f, filename=original_filename, message_thread_id=t_ok)
-                        os.remove(final_path)
+                        os.remove(result)
                         success += 1
                         
                     elif status == "FIXED":
-                        final_path = os.path.join(TEMP_DIR, original_filename)
-                        os.rename(result, final_path)
-                        with open(final_path, 'rb') as f:
+                        with open(result, 'rb') as f:
                             await bot.send_document(chat_id=target, document=f, filename=original_filename, message_thread_id=t_fixed)
-                        os.remove(final_path)
+                        os.remove(result)
                         fixed += 1
                         
                     elif status == "REDOWNLOADED":
-                        # Original redownload keeps its native lncrawl name
-                        new_filename = os.path.basename(result)
                         with open(result, 'rb') as f:
-                            await bot.send_document(chat_id=target, document=f, filename=new_filename, message_thread_id=t_re)
+                            await bot.send_document(chat_id=target, document=f, filename=original_filename, message_thread_id=t_re)
                         shutil.rmtree(os.path.dirname(result), ignore_errors=True)
                         redownloaded += 1
                         
@@ -253,7 +244,7 @@ class HealerBot:
         await status_msg.edit_text(f"✅ Streaming Complete! Processed up to ID {end_msg_id}.")
 
     def start(self):
-        print("🚀 Bot Starting (Strict Title Matching & Receipts)...")
+        print("🚀 Bot Starting (Strict Title Matching & Chunk Sorting)...")
         app = Application.builder().token(TOKEN).post_init(self.post_init).post_stop(self.post_stop).build()
 
         app.add_handler(CommandHandler("start", self.cmd_start))

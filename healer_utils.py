@@ -35,25 +35,18 @@ def clean_text(text):
     decoded = html.unescape(str(text))
     return " ".join(decoded.split())
 
-def get_sort_tuple(title):
-    """
-    Mathematically forces titles into numerical order to destroy the pagination bug.
-    Handles up to 3 numbers (e.g. Volume 1 Chapter 100 Part 2 -> 1, 100, 2)
-    """
+def extract_anchor_number(title):
+    """Safely extracts the primary identifying chapter number."""
     t = str(title).lower()
+    # Lock explicit chapter designators first
+    match = re.search(r'(?:chapter|ch\.?|c)\s*(\d+(?:\.\d+)?)', t)
+    if match: return float(match.group(1))
     
-    # Lock special chapters to start/end
-    if 'prologue' in t: return (0, 0, 0, 0)
-    if 'epilogue' in t: return (2, 0, 0, 0)
-    
+    # Fallback to the first available number
     nums = re.findall(r'\d+', t)
+    if nums: return float(nums[0])
     
-    # (Primary Sort, Num 1, Num 2, Num 3)
-    n1 = int(nums[0]) if len(nums) > 0 else 999999
-    n2 = int(nums[1]) if len(nums) > 1 else 0
-    n3 = int(nums[2]) if len(nums) > 2 else 0
-    
-    return (1, n1, n2, n3)
+    return None
 
 def extract_url_from_epub(epub_path):
     extract_dir = epub_path + "_unzipped"
@@ -81,7 +74,7 @@ def extract_url_from_epub(epub_path):
     return match.group(1), extract_dir, None
 
 def fetch_live_toc(url):
-    """Fetches TOC, naturally sorts it in-memory to defeat pagination bugs, and maps it."""
+    """Fetches TOC and uses Chunk Boundary Sorting to fix async bugs without destroying Interludes."""
     app = App()
     try:
         app.user_input = url
@@ -97,13 +90,42 @@ def fetch_live_toc(url):
             chap_title = chap.get('title', '') if isinstance(chap, dict) else getattr(chap, 'title', '')
             raw_chapters.append(chap_title)
             
-        # THE FIX: Mathematically sort the corrupted asynchronous array into sequential order
-        raw_chapters.sort(key=get_sort_tuple)
+        # --- CHUNK BOUNDARY SORTING ALGORITHM ---
+        chunks = []
+        current_chunk = []
+        last_num = None
+        
+        for title in raw_chapters:
+            num = extract_anchor_number(title)
+            
+            if num is not None and last_num is not None:
+                # If chapter jumps heavily forward or backward, it's a page boundary
+                if abs(num - last_num) > 25: 
+                    chunks.append(current_chunk)
+                    current_chunk = []
+            
+            current_chunk.append(title)
+            if num is not None:
+                last_num = num
+                
+        if current_chunk:
+            chunks.append(current_chunk)
+            
+        def chunk_sort_key(chunk):
+            """Sorts the chunk based on its first numbered chapter"""
+            for title in chunk:
+                num = extract_anchor_number(title)
+                if num is not None: return num
+            return 999999
+            
+        chunks.sort(key=chunk_sort_key)
+        sorted_raw_chapters = [title for chunk in chunks for title in chunk]
+        # ----------------------------------------
         
         canonical_toc = {}
         has_duplicates = False
         
-        for idx, chap_title in enumerate(raw_chapters):
+        for idx, chap_title in enumerate(sorted_raw_chapters):
             cleaned = clean_text(chap_title)
             if cleaned:
                 if cleaned in canonical_toc:
@@ -117,7 +139,6 @@ def fetch_live_toc(url):
         app.destroy()
 
 def extract_title_from_html(html_path):
-    """Reverse logic: Target exactly what lncrawl injects into the <title> tag."""
     with open(html_path, 'r', encoding='utf-8') as f:
         soup = BeautifulSoup(f.read(), 'html.parser')
     title_tag = soup.find('title')
@@ -131,7 +152,6 @@ def fix_epub_spine(epub_path, extract_dir, canonical_toc, log_data):
         log_data.append("❌ Missing chapters detected in EPUB compared to live source.")
         return "REDOWNLOAD", None
 
-    # --- STRICT WORD-FOR-WORD MAP ---
     file_to_true_index = {}
     seen_epub_titles = set()
     
@@ -140,7 +160,6 @@ def fix_epub_spine(epub_path, extract_dir, canonical_toc, log_data):
         raw_title = extract_title_from_html(abs_chap_path)
         cleaned_title = clean_text(raw_title)
         
-        # EPUB Duplicate detection
         if cleaned_title in seen_epub_titles:
             shutil.rmtree(extract_dir, ignore_errors=True)
             log_data.append(f"⚠️ Duplicate title found inside EPUB: '{raw_title}'. Cannot safely sort.")
@@ -154,7 +173,7 @@ def fix_epub_spine(epub_path, extract_dir, canonical_toc, log_data):
             log_data.append(f"⚠️ Exact title '{raw_title}' not found in live source TOC. Source may have changed.")
             return "REDOWNLOAD", None
 
-    # --- 1. REORDER THE .OPF SPINE ---
+    # --- 1. REORDER OPF ---
     opf_path = next((os.path.join(r, f) for r, _, fs in os.walk(extract_dir) for f in fs if f.endswith(".opf")), None)
     with open(opf_path, 'r', encoding='utf-8') as f:
         opf_soup = BeautifulSoup(f.read(), 'xml')
@@ -192,7 +211,7 @@ def fix_epub_spine(epub_path, extract_dir, canonical_toc, log_data):
     with open(opf_path, 'w', encoding='utf-8') as f:
         f.write(str(opf_soup))
 
-    # --- 2. REORDER THE TOC.NCX ---
+    # --- 2. REORDER NCX ---
     ncx_path = next((os.path.join(r, f) for r, _, fs in os.walk(extract_dir) for f in fs if f.endswith(".ncx")), None)
     if ncx_path:
         with open(ncx_path, 'r', encoding='utf-8') as f:
@@ -217,7 +236,7 @@ def fix_epub_spine(epub_path, extract_dir, canonical_toc, log_data):
             with open(ncx_path, 'w', encoding='utf-8') as f:
                 f.write(str(ncx_soup))
 
-    # --- 3. REORDER THE TOC.XHTML ---
+    # --- 3. REORDER TOC.XHTML ---
     toc_xhtml = next((os.path.join(r, f) for r, _, fs in os.walk(extract_dir) for f in fs if f in ["toc.xhtml", "nav.xhtml"]), None)
     if toc_xhtml:
         with open(toc_xhtml, 'r', encoding='utf-8') as f:
@@ -242,11 +261,18 @@ def fix_epub_spine(epub_path, extract_dir, canonical_toc, log_data):
                 f.write(str(toc_soup))
         
     fixed_epub_path = epub_path.replace('.epub', '_fixed.epub')
-    with zipfile.ZipFile(fixed_epub_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+    with zipfile.ZipFile(fixed_epub_path, 'w') as zipf:
+        # STRICT EPUB STANDARD: mimetype must be first and uncompressed
+        mimetype_path = os.path.join(extract_dir, 'mimetype')
+        if os.path.exists(mimetype_path):
+            zipf.write(mimetype_path, 'mimetype', compress_type=zipfile.ZIP_STORED)
+            
         for r, _, fs in os.walk(extract_dir):
             for file in fs:
+                if file == 'mimetype' and r == extract_dir:
+                    continue # Already wrote this
                 abs_path = os.path.join(r, file)
-                zipf.write(abs_path, os.path.relpath(abs_path, extract_dir))
+                zipf.write(abs_path, os.path.relpath(abs_path, extract_dir), compress_type=zipfile.ZIP_DEFLATED)
                 
     shutil.rmtree(extract_dir, ignore_errors=True)
     log_data.append(f"🛠️ Successfully mapped {len(epub_chapters)} chapters word-for-word. All Spines and TOCs rewritten.")

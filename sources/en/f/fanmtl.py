@@ -80,20 +80,30 @@ class FanMTLCrawler(Crawler):
                 wjm_params = query.get("wjm", [""])
                 wjm = wjm_params[0]
 
+                # Helper to bind the page index to the future result
+                def fetch_page(page_idx, p_url):
+                    return page_idx, self.get_soup(p_url)
+
                 futures = []
-                # NOTE: For massive novels, this loop creates many futures. 
-                # Ideally, fetch pages in chunks, but for <5000 chapters it's usually fine.
                 for page in range(page_count):
                     url = f"{common_url}?page={page}&wjm={wjm}"
-                    futures.append(self.executor.submit(self.get_soup, url))
+                    futures.append(self.executor.submit(fetch_page, page, url))
                 
-                for page_soup in self.resolve_futures(futures, desc="TOC", unit="page"):
-                    self.parse_chapter_list(page_soup)
+                # Download async, but store in a dictionary to preserve the exact page index
+                pages_data = {}
+                for result in self.resolve_futures(futures, desc="TOC", unit="page"):
+                    page_idx, page_soup = result
+                    pages_data[page_idx] = page_soup
+                
+                # Parse sequentially from Page 0 to Page N. 
+                # This guarantees 100% accurate native source order without guesswork.
+                for page in range(page_count):
+                    if page in pages_data:
+                        self.parse_chapter_list(pages_data[page])
+
             except Exception as e:
                 logger.error(f"Pagination failed: {e}. Parsing current page.")
                 self.parse_chapter_list(soup)
-
-        self.chapters.sort(key=lambda x: x["id"] if isinstance(x, dict) else getattr(x, "id", 0))
 
     def parse_chapter_list(self, soup):
         if not soup: return
