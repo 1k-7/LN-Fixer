@@ -26,7 +26,7 @@ DATA_DIR = "data"
 TEMP_DIR = "temp_epubs"
 CONFIG_FILE = os.path.join(DATA_DIR, "config.json")
 
-# Force absolute paths to prevent Pyrogram from sneaking files into a default "downloads/" folder
+# Force absolute paths
 ABS_TEMP_DIR = os.path.abspath(TEMP_DIR)
 os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(ABS_TEMP_DIR, exist_ok=True)
@@ -45,11 +45,16 @@ class HealerBot:
         self.executor = None
         self.userbot = None
         self.config = {}
-        # Protects Telegram MTProto from concurrent download connection drops
-        self.download_semaphore = asyncio.Semaphore(2)
+        # Safely bumped from 2 to 4. Active retry loop protects us from MTProto drops.
+        self.download_semaphore = asyncio.Semaphore(4) 
+        
+        # Detect host CPU cores to dynamically scale the heavy-lifting process pool
+        self.cpu_cores = os.cpu_count() or 4
 
     async def post_init(self, application: Application):
-        self.executor = ProcessPoolExecutor(max_workers=4)
+        # Dynamically scale parallel zip/scrape processing to match host hardware
+        self.executor = ProcessPoolExecutor(max_workers=self.cpu_cores)
+        logger.info(f"⚙️ ProcessPoolExecutor spun up with {self.cpu_cores} dedicated CPU cores.")
         
         if os.path.exists(CONFIG_FILE):
             with open(CONFIG_FILE, 'r') as f:
@@ -77,7 +82,7 @@ class HealerBot:
 
     async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
-            "🛠 **LN EPUB Continuous Pipeline Ready**\n\n"
+            "🛠 **LN EPUB High-Throughput Pipeline Ready**\n\n"
             "1. Send `/setup <supergroup_id>` to initialize Topics.\n"
             "2. Send `/process <message_link>` to start parsing."
         )
@@ -131,30 +136,30 @@ class HealerBot:
         except Exception:
             return await update.message.reply_text("⚠️ Invalid message link format.")
 
-        await update.message.reply_text(f"🚀 Continuous Pipeline Started!\nSource: `{source_chat}`\nTarget ID: `1` to `{end_msg_id}`")
+        await update.message.reply_text(f"🚀 High-Throughput Pipeline Started!\nSource: `{source_chat}`\nTarget ID: `1` to `{end_msg_id}`\nCores utilized: `{self.cpu_cores}`")
         asyncio.create_task(self.run_streaming_loop(update.effective_chat.id, source_chat, end_msg_id, context.bot))
 
-    async def status_updater(self, status_msg, stats, end_msg_id):
+    async def status_updater(self, status_msg, stats, end_msg_id, process_q, upload_q):
         while True:
             try:
-                queue_remaining = stats.total_found - stats.processed
                 await status_msg.edit_text(
-                    f"🔄 **Pipeline Active (Zero-Delay)**\n"
+                    f"🚀 **Pipeline Active (Decoupled & Accelerated)**\n"
                     f"Found {stats.total_found} valid EPUBs up to ID {end_msg_id}.\n\n"
                     f"✅ OK: {stats.success} | 🛠 Fixed: {stats.fixed}\n"
                     f"📥 Redownloaded: {stats.redownloaded} | ❌ Errors: {stats.errors}\n\n"
-                    f"⚙️ Conveyor Belt: `{queue_remaining}` files remaining..."
+                    f"⚙️ Processing Queue: `{process_q.qsize()}`\n"
+                    f"📤 Upload Queue: `{upload_q.qsize()}`"
                 )
             except Exception:
                 pass
             await asyncio.sleep(5)
 
     async def process_single_epub(self, msg, loop):
+        """Core scraping/zipping logic (Unchanged, just runs faster natively)"""
         log_data = []
         original_filename = msg.document.file_name
         epub_path = os.path.join(ABS_TEMP_DIR, f"{msg.id}.epub")
         
-        # --- 1. ACTIVE RETRY DOWNLOAD LOOP ---
         MAX_RETRIES = 3
         download_success = False
         
@@ -167,25 +172,20 @@ class HealerBot:
                 except Exception as e:
                     logger.warning(f"Download attempt {attempt + 1} failed for {original_filename}: {e}")
 
-            # INTEGRITY CHECK
             if os.path.exists(epub_path):
                 file_size = os.path.getsize(epub_path)
                 if file_size >= 1024: 
                     download_success = True
-                    break # Success! Break out of the retry loop.
+                    break
                 else:
-                    # It's a 0-byte or corrupted file. Delete it immediately.
                     os.remove(epub_path)
-                    logger.warning(f"0-byte file detected for {original_filename}. Attempt {attempt + 1} of {MAX_RETRIES}.")
             
-            # Exponential Backoff before retrying (Wait 2s, then 4s, etc.)
             await asyncio.sleep(2 * (attempt + 1))
             
         if not download_success:
             log_data.append(f"❌ Network drop detected. Failed to download a valid file after {MAX_RETRIES} attempts.")
             return "ERROR", "Corrupt Empty File", log_data
 
-        # --- 2. STANDARD LOGIC ---
         url, extract_dir, err = await loop.run_in_executor(self.executor, extract_url_from_epub, epub_path)
         if err:
             if os.path.exists(epub_path): os.remove(epub_path)
@@ -228,14 +228,29 @@ class HealerBot:
             
         return status, result, log_data
 
-    async def worker(self, queue, target, t_ok, t_fixed, t_re, t_logs, bot, loop, stats):
+    async def process_worker(self, process_queue, upload_queue, loop):
+        """Pulls from process belt -> Fixes File -> Pushes to Upload Belt."""
         while True:
-            msg = await queue.get()
+            msg = await process_queue.get()
             try:
                 status, result, log_data = await self.process_single_epub(msg, loop)
+                # Shove the finished file into the upload queue instantly so the CPU is freed
+                await upload_queue.put((msg, status, result, log_data))
+            except Exception as e:
+                logger.error(f"Worker exception on msg {msg.id}: {e}")
+                # Log errors to be tracked by upload worker
+                await upload_queue.put((msg, "ERROR", None, [f"Fatal exception: {e}"]))
+            finally:
+                process_queue.task_done()
+
+    async def upload_worker(self, upload_queue, bot, target, t_ok, t_fixed, t_re, t_logs, stats):
+        """Pulls from Upload Belt -> Sends to Telegram. Blocks network, not CPU."""
+        while True:
+            msg, status, result, log_data = await upload_queue.get()
+            try:
                 original_filename = msg.document.file_name
-                
                 log_text = f"📄 **File:** `{original_filename}`\n⚙️ **Status:** `{status}`\n" + "\n".join(log_data)
+                
                 try:
                     await bot.send_message(chat_id=target, text=log_text, message_thread_id=t_logs)
                 except Exception as e:
@@ -262,18 +277,19 @@ class HealerBot:
                         
                     elif status == "ERROR":
                         stats.errors += 1
+                        
                 except Exception as e:
                     logger.error(f"Routing failed for {msg.id}: {e}")
                     stats.errors += 1
             except Exception as e:
-                logger.error(f"Worker exception on msg {msg.id}: {e}")
+                logger.error(f"Uploader exception on msg {msg.id}: {e}")
                 stats.errors += 1
             finally:
                 stats.processed += 1
-                queue.task_done()
+                upload_queue.task_done()
 
     async def run_streaming_loop(self, chat_id, source_chat, end_msg_id, bot):
-        status_msg = await bot.send_message(chat_id=chat_id, text="Spinning up Continuous Pipeline...")
+        status_msg = await bot.send_message(chat_id=chat_id, text="Spinning up 3-Stage Pipeline...")
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, load_sources)
 
@@ -284,15 +300,26 @@ class HealerBot:
         t_logs = self.config["topic_logs"]
 
         stats = PipelineStats()
-        epub_queue = asyncio.Queue()
+        process_queue = asyncio.Queue()
+        upload_queue = asyncio.Queue()
 
-        workers = [
-            asyncio.create_task(self.worker(epub_queue, target, t_ok, t_fixed, t_re, t_logs, bot, loop, stats))
-            for _ in range(4)
+        # DYNAMIC SCALING: Create async processor tasks = (CPU Cores * 2) 
+        # (Multiplier handles the fact that async tasks wait on network downloads heavily)
+        process_workers = [
+            asyncio.create_task(self.process_worker(process_queue, upload_queue, loop))
+            for _ in range(max(4, self.cpu_cores * 2))
         ]
 
-        updater_task = asyncio.create_task(self.status_updater(status_msg, stats, end_msg_id))
+        # NETWORK SCALING: Create 3 dedicated uploaders to respect Telegram's bot API rate limits
+        upload_workers = [
+            asyncio.create_task(self.upload_worker(upload_queue, bot, target, t_ok, t_fixed, t_re, t_logs, stats))
+            for _ in range(3)
+        ]
 
+        # UI Task
+        updater_task = asyncio.create_task(self.status_updater(status_msg, stats, end_msg_id, process_queue, upload_queue))
+
+        # PRODUCER LOOP
         for chunk_start in range(1, end_msg_id + 1, 100):
             chunk_end = min(chunk_start + 99, end_msg_id)
             msg_ids = list(range(chunk_start, chunk_end + 1))
@@ -302,26 +329,31 @@ class HealerBot:
                 valid_msgs = [m for m in messages if m and m.document and m.document.file_name and m.document.file_name.endswith('.epub')]
                 for m in valid_msgs:
                     stats.total_found += 1
-                    await epub_queue.put(m)
+                    await process_queue.put(m)
             except Exception as e:
                 logger.error(f"❌ Userbot failed to fetch messages for ids {chunk_start}-{chunk_end}. Error: {e}")
                 await asyncio.sleep(5) 
 
-        await epub_queue.join()
+        # Wait for all processing to finish
+        await process_queue.join()
+        
+        # Wait for all uploads to finish
+        await upload_queue.join()
 
-        for w in workers:
-            w.cancel()
+        # Kill background tasks
+        for w in process_workers: w.cancel()
+        for w in upload_workers: w.cancel()
         updater_task.cancel()
 
         await status_msg.edit_text(
-            f"✅ **Pipeline Complete!**\n\n"
+            f"✅ **High-Throughput Pipeline Complete!**\n\n"
             f"Processed {stats.total_found} valid EPUBs up to ID {end_msg_id}.\n"
             f"✅ OK: {stats.success} | 🛠 Fixed: {stats.fixed}\n"
             f"📥 Redownloaded: {stats.redownloaded} | ❌ Errors: {stats.errors}"
         )
 
     def start(self):
-        print("🚀 Bot Starting (Download Retries Enabled)...")
+        print("🚀 Bot Starting (Decoupled 3-Stage Pipeline)...")
         app = Application.builder().token(TOKEN).post_init(self.post_init).post_stop(self.post_stop).build()
 
         app.add_handler(CommandHandler("start", self.cmd_start))
