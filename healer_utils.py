@@ -35,19 +35,6 @@ def clean_text(text):
     decoded = html.unescape(str(text))
     return " ".join(decoded.split())
 
-def extract_anchor_number(title):
-    """Safely extracts the primary identifying chapter number."""
-    t = str(title).lower()
-    # Lock explicit chapter designators first
-    match = re.search(r'(?:chapter|ch\.?|c)\s*(\d+(?:\.\d+)?)', t)
-    if match: return float(match.group(1))
-    
-    # Fallback to the first available number
-    nums = re.findall(r'\d+', t)
-    if nums: return float(nums[0])
-    
-    return None
-
 def extract_url_from_epub(epub_path):
     extract_dir = epub_path + "_unzipped"
     os.makedirs(extract_dir, exist_ok=True)
@@ -74,7 +61,11 @@ def extract_url_from_epub(epub_path):
     return match.group(1), extract_dir, None
 
 def fetch_live_toc(url):
-    """Fetches TOC and uses Chunk Boundary Sorting to fix async bugs without destroying Interludes."""
+    """
+    Fetches TOC exactly as it appears on the source.
+    ZERO mathematical sorting. ZERO guesswork.
+    Relies purely on the patched scraper to provide the 1:1 IRL order.
+    """
     app = App()
     try:
         app.user_input = url
@@ -85,48 +76,13 @@ def fetch_live_toc(url):
             
         app.get_novel_info()
         
-        raw_chapters = []
-        for chap in app.crawler.chapters:
-            chap_title = chap.get('title', '') if isinstance(chap, dict) else getattr(chap, 'title', '')
-            raw_chapters.append(chap_title)
-            
-        # --- CHUNK BOUNDARY SORTING ALGORITHM ---
-        chunks = []
-        current_chunk = []
-        last_num = None
-        
-        for title in raw_chapters:
-            num = extract_anchor_number(title)
-            
-            if num is not None and last_num is not None:
-                # If chapter jumps heavily forward or backward, it's a page boundary
-                if abs(num - last_num) > 25: 
-                    chunks.append(current_chunk)
-                    current_chunk = []
-            
-            current_chunk.append(title)
-            if num is not None:
-                last_num = num
-                
-        if current_chunk:
-            chunks.append(current_chunk)
-            
-        def chunk_sort_key(chunk):
-            """Sorts the chunk based on its first numbered chapter"""
-            for title in chunk:
-                num = extract_anchor_number(title)
-                if num is not None: return num
-            return 999999
-            
-        chunks.sort(key=chunk_sort_key)
-        sorted_raw_chapters = [title for chunk in chunks for title in chunk]
-        # ----------------------------------------
-        
         canonical_toc = {}
         has_duplicates = False
         
-        for idx, chap_title in enumerate(sorted_raw_chapters):
+        for idx, chap in enumerate(app.crawler.chapters):
+            chap_title = chap.get('title', '') if isinstance(chap, dict) else getattr(chap, 'title', '')
             cleaned = clean_text(chap_title)
+            
             if cleaned:
                 if cleaned in canonical_toc:
                     has_duplicates = True

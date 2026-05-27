@@ -14,19 +14,12 @@ class FanMTLCrawler(Crawler):
     base_url = "https://www.fanmtl.com/"
 
     def initialize(self):
-        # 1. REDUCE THREADS: 8 is too high for a protected site, keeps RAM lower.
         self.init_executor(3)
-        
-        # 2. THE FIX: Overwrite the default cloudscraper with a basic Requests Session
-        # This prevents it from launching Node.js/JS engines in the background.
         self.scraper = requests.Session()
-        
-        # 3. Add standard headers so you don't look like a bot
         self.scraper.headers.update({
             "User-Agent": "Mozilla/5.0 (Windows NT 11.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
             "Accept-Language": "en-US,en;q=0.9",
         })
-
         self.cleaner.bad_css.update({'div[align="center"]'})
 
         retry = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
@@ -36,7 +29,6 @@ class FanMTLCrawler(Crawler):
 
     def read_novel_info(self):
         logger.debug("Visiting %s", self.novel_url)
-        # This will now use the lightweight requests session
         soup = self.get_soup(self.novel_url)
 
         possible_title = soup.select_one("h1.novel-title")
@@ -80,7 +72,6 @@ class FanMTLCrawler(Crawler):
                 wjm_params = query.get("wjm", [""])
                 wjm = wjm_params[0]
 
-                # Helper to bind the page index to the future result
                 def fetch_page(page_idx, p_url):
                     return page_idx, self.get_soup(p_url)
 
@@ -89,14 +80,16 @@ class FanMTLCrawler(Crawler):
                     url = f"{common_url}?page={page}&wjm={wjm}"
                     futures.append(self.executor.submit(fetch_page, page, url))
                 
-                # Download async, but store in a dictionary to preserve the exact page index
+                # Fetch asynchronously, but map them to their exact native page number
                 pages_data = {}
                 for result in self.resolve_futures(futures, desc="TOC", unit="page"):
-                    page_idx, page_soup = result
-                    pages_data[page_idx] = page_soup
+                    try:
+                        page_idx, page_soup = result
+                        pages_data[page_idx] = page_soup
+                    except Exception as e:
+                        logger.error(f"Failed to fetch page: {e}")
                 
-                # Parse sequentially from Page 0 to Page N. 
-                # This guarantees 100% accurate native source order without guesswork.
+                # Parse them strictly sequentially from 0 to N. Zero guesswork.
                 for page in range(page_count):
                     if page in pages_data:
                         self.parse_chapter_list(pages_data[page])
@@ -118,7 +111,6 @@ class FanMTLCrawler(Crawler):
             except: pass
 
     def download_chapter_body(self, chapter):
-        # Uses the lightweight self.scraper (requests) defined in initialize
         soup = self.get_soup(chapter["url"])
         body = soup.select_one("#chapter-article .chapter-content")
         if not body: return None
