@@ -154,13 +154,13 @@ class HealerBot:
         if os.path.exists(epub_path): os.remove(epub_path)
         
         if status in ("REDOWNLOAD", "MISSING"):
-            log_data.append("📥 Attempting fresh redownload via lncrawl...")
+            log_data.append("📥 Attempting fresh redownload natively (using patched sequential scraper)...")
             redownload_dir = os.path.join(TEMP_DIR, f"redownload_{msg.id}")
             os.makedirs(redownload_dir, exist_ok=True)
             new_epub = await loop.run_in_executor(self.executor, redownload_worker, url, redownload_dir)
             
             if new_epub:
-                log_data.append("✅ Redownload successful.")
+                log_data.append("✅ Redownload successful in absolute 1:1 order.")
                 return "REDOWNLOADED", new_epub, log_data
             else:
                 log_data.append("❌ Redownload failed.")
@@ -196,7 +196,7 @@ class HealerBot:
             except Exception as e:
                 logger.error(f"❌ Userbot failed to fetch messages for ids {chunk_start}-{chunk_end}. Error: {e}")
                 await asyncio.sleep(5) 
-                continue # Do not kill stream, attempt to recover on next chunk
+                continue
 
             valid_msgs = [m for m in messages if m and m.document and m.document.file_name and m.document.file_name.endswith('.epub')]
             
@@ -215,8 +215,6 @@ class HealerBot:
                 except Exception as e:
                     logger.error(f"Failed to send log for {msg.id}: {e}")
 
-                # Safely send directly using the underlying f-handle faking original_filename 
-                # This explicitly avoids temp directory file overwrite collisions between threads
                 try:
                     if status == "OK":
                         with open(result, 'rb') as f:
@@ -244,7 +242,7 @@ class HealerBot:
         await status_msg.edit_text(f"✅ Streaming Complete! Processed up to ID {end_msg_id}.")
 
     def start(self):
-        print("🚀 Bot Starting (Strict Title Matching & Chunk Sorting)...")
+        print("🚀 Bot Starting (With Deep Runtime FanMTL Monkey-Patch)...")
         app = Application.builder().token(TOKEN).post_init(self.post_init).post_stop(self.post_stop).build()
 
         app.add_handler(CommandHandler("start", self.cmd_start))

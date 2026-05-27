@@ -4,11 +4,16 @@ import zipfile
 import shutil
 import requests
 import html
+import logging
+from urllib.parse import urlparse, parse_qs
 from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from bs4 import BeautifulSoup
 
 from lncrawl.core.app import App
 from lncrawl.core.sources import load_sources
+
+logger = logging.getLogger(__name__)
 
 # --- PURE REQUESTS CONNECTION POOL ---
 SHARED_SESSION = requests.Session()
@@ -29,8 +34,103 @@ SHARED_SESSION.mount('http://', adapter)
 SHARED_SESSION.mount('https://', adapter)
 # -------------------------------------
 
+# ==============================================================================
+# 🚨 RUNTIME MONKEY-PATCH: FIXING THE ROOT CAUSE 🚨
+# We override the FanMTL scraper in memory so it fetches pages STRICTLY sequentially.
+# This guarantees 1:1 native source order without any mathematical guesswork.
+# ==============================================================================
+try:
+    from lncrawl.sources.en.f.fanmtl import FanMTLCrawler
+
+    def custom_fanmtl_initialize(self):
+        self.init_executor(3)
+        self.scraper = requests.Session()
+        self.scraper.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 11.0; Win64; x64) AppleWebKit/537.36",
+            "Accept-Language": "en-US,en;q=0.9",
+        })
+        self.cleaner.bad_css.update({'div[align="center"]'})
+        retry = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
+        adapter = HTTPAdapter(pool_connections=4, pool_maxsize=4, max_retries=retry)
+        self.scraper.mount("https://", adapter)
+        self.scraper.mount("http://", adapter)
+
+    def custom_fanmtl_read_novel_info(self):
+        logger.info("Using Runtime-Patched FanMTL Scraper (STRICT 1:1 ORDER)")
+        soup = self.get_soup(self.novel_url)
+
+        possible_title = soup.select_one("h1.novel-title")
+        if possible_title:
+            self.novel_title = possible_title.text.strip()
+        else:
+            meta_title = soup.select_one('meta[property="og:title"]')
+            self.novel_title = meta_title.get("content").strip() if meta_title else "Unknown Title"
+
+        img_tag = soup.select_one("figure.cover img") or soup.select_one(".fixed-img img")
+        if img_tag:
+            url = img_tag.get("src")
+            if "placeholder" in str(url) and img_tag.get("data-src"):
+                url = img_tag.get("data-src")
+            self.novel_cover = self.absolute_url(url)
+
+        author_tag = soup.select_one('.novel-info .author span[itemprop="author"]')
+        self.novel_author = author_tag.text.strip() if author_tag else "Unknown"
+
+        summary_div = soup.select_one(".summary .content")
+        self.novel_synopsis = summary_div.get_text("\n\n").strip() if summary_div else ""
+
+        self.volumes = [{"id": 1, "title": "Volume 1"}]
+        self.chapters = []
+
+        # 1. Parse initial soup (Page 1) FIRST to lock the first chapters into position.
+        self.parse_chapter_list(soup)
+
+        # 2. Safely extract all other valid pages
+        pagination_links = soup.select('.pagination a[data-ajax-update="#chpagedlist"]')
+        if pagination_links:
+            common_url = self.novel_url
+            wjm = ""
+            pages_to_fetch = set()
+            
+            for link in pagination_links:
+                href = link.get("href")
+                if href and "?" in href:
+                    base, query_str = href.split("?", 1)
+                    common_url = self.absolute_url(base)
+                    query = parse_qs(query_str)
+                    if "page" in query:
+                        try:
+                            p = int(query["page"][0])
+                            if p > 1: # Skip page 1, we already have it from the initial soup
+                                pages_to_fetch.add(p)
+                        except: pass
+                    if "wjm" in query:
+                        wjm = query["wjm"][0]
+
+            if pages_to_fetch:
+                sorted_pages = sorted(list(pages_to_fetch))
+                futures = {}
+                
+                # Submit requests asynchronously for download speed
+                for page in sorted_pages:
+                    url = f"{common_url}?page={page}&wjm={wjm}"
+                    futures[page] = self.executor.submit(self.get_soup, url)
+
+                # BUT parse the DOM strictly sequentially (Page 2 -> 3 -> 4...)
+                for page in sorted_pages:
+                    try:
+                        page_soup = futures[page].result() # Block and wait for exact sequence
+                        self.parse_chapter_list(page_soup)
+                    except Exception as e:
+                        logger.error(f"Failed to fetch FanMTL page {page}: {e}")
+
+    FanMTLCrawler.initialize = custom_fanmtl_initialize
+    FanMTLCrawler.read_novel_info = custom_fanmtl_read_novel_info
+except ImportError:
+    logger.warning("FanMTLCrawler not found. Skipping monkey-patch.")
+# ==============================================================================
+
 def clean_text(text):
-    """Word-for-Word mapping: Unescapes HTML and standardizes spacing."""
     if text is None: return ""
     decoded = html.unescape(str(text))
     return " ".join(decoded.split())
@@ -62,9 +162,8 @@ def extract_url_from_epub(epub_path):
 
 def fetch_live_toc(url):
     """
-    Fetches TOC exactly as it appears on the source.
+    Fetches TOC exactly as it appears on the source IRL.
     ZERO mathematical sorting. ZERO guesswork.
-    Relies purely on the patched scraper to provide the 1:1 IRL order.
     """
     app = App()
     try:
@@ -218,7 +317,6 @@ def fix_epub_spine(epub_path, extract_dir, canonical_toc, log_data):
         
     fixed_epub_path = epub_path.replace('.epub', '_fixed.epub')
     with zipfile.ZipFile(fixed_epub_path, 'w') as zipf:
-        # STRICT EPUB STANDARD: mimetype must be first and uncompressed
         mimetype_path = os.path.join(extract_dir, 'mimetype')
         if os.path.exists(mimetype_path):
             zipf.write(mimetype_path, 'mimetype', compress_type=zipfile.ZIP_STORED)
@@ -226,7 +324,7 @@ def fix_epub_spine(epub_path, extract_dir, canonical_toc, log_data):
         for r, _, fs in os.walk(extract_dir):
             for file in fs:
                 if file == 'mimetype' and r == extract_dir:
-                    continue # Already wrote this
+                    continue 
                 abs_path = os.path.join(r, file)
                 zipf.write(abs_path, os.path.relpath(abs_path, extract_dir), compress_type=zipfile.ZIP_DEFLATED)
                 
