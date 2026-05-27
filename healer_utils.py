@@ -4,6 +4,7 @@ import zipfile
 import shutil
 import requests
 import html
+import unicodedata
 import logging
 from urllib.parse import urlparse, parse_qs
 from requests.adapters import HTTPAdapter
@@ -18,7 +19,7 @@ logger = logging.getLogger(__name__)
 # --- PURE REQUESTS CONNECTION POOL ---
 SHARED_SESSION = requests.Session()
 SHARED_SESSION.headers.update({
-    "User-Agent": "Mozilla/5.0 (Windows NT 11.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+    "User-Agent": "Mozilla/5.0 (Windows NT 11.0; Win64; x64) AppleWebKit/537.36",
     "Accept-Language": "en-US,en;q=0.9",
 })
 
@@ -34,106 +35,71 @@ SHARED_SESSION.mount('http://', adapter)
 SHARED_SESSION.mount('https://', adapter)
 # -------------------------------------
 
-# ==============================================================================
-# 🚨 RUNTIME MONKEY-PATCH: FIXING THE ROOT CAUSE 🚨
-# We override the FanMTL scraper in memory so it fetches pages STRICTLY sequentially.
-# This guarantees 1:1 native source order without any mathematical guesswork.
-# ==============================================================================
-try:
-    from lncrawl.sources.en.f.fanmtl import FanMTLCrawler
+def apply_fanmtl_patch():
+    """
+    Injected per-process to guarantee the ProcessPoolExecutor doesn't lose the patch.
+    Forces FanMTL to scrape SYNCHRONOUSLY. Zero guesswork. Zero async race conditions.
+    """
+    try:
+        from lncrawl.sources.en.f.fanmtl import FanMTLCrawler
+        if getattr(FanMTLCrawler, '_is_healer_patched', False):
+            return
 
-    def custom_fanmtl_initialize(self):
-        self.init_executor(3)
-        self.scraper = requests.Session()
-        self.scraper.headers.update({
-            "User-Agent": "Mozilla/5.0 (Windows NT 11.0; Win64; x64) AppleWebKit/537.36",
-            "Accept-Language": "en-US,en;q=0.9",
-        })
-        self.cleaner.bad_css.update({'div[align="center"]'})
-        retry = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
-        adapter = HTTPAdapter(pool_connections=4, pool_maxsize=4, max_retries=retry)
-        self.scraper.mount("https://", adapter)
-        self.scraper.mount("http://", adapter)
+        def custom_read_novel_info(self):
+            soup = self.get_soup(self.novel_url)
+            possible_title = soup.select_one("h1.novel-title")
+            self.novel_title = possible_title.text.strip() if possible_title else "Unknown"
 
-    def custom_fanmtl_read_novel_info(self):
-        logger.info("Using Runtime-Patched FanMTL Scraper (STRICT 1:1 ORDER)")
-        soup = self.get_soup(self.novel_url)
+            img_tag = soup.select_one("figure.cover img") or soup.select_one(".fixed-img img")
+            if img_tag:
+                url = img_tag.get("src")
+                if "placeholder" in str(url) and img_tag.get("data-src"):
+                    url = img_tag.get("data-src")
+                self.novel_cover = self.absolute_url(url)
 
-        possible_title = soup.select_one("h1.novel-title")
-        if possible_title:
-            self.novel_title = possible_title.text.strip()
-        else:
-            meta_title = soup.select_one('meta[property="og:title"]')
-            self.novel_title = meta_title.get("content").strip() if meta_title else "Unknown Title"
+            author_tag = soup.select_one('.novel-info .author span[itemprop="author"]')
+            self.novel_author = author_tag.text.strip() if author_tag else "Unknown"
 
-        img_tag = soup.select_one("figure.cover img") or soup.select_one(".fixed-img img")
-        if img_tag:
-            url = img_tag.get("src")
-            if "placeholder" in str(url) and img_tag.get("data-src"):
-                url = img_tag.get("data-src")
-            self.novel_cover = self.absolute_url(url)
+            summary_div = soup.select_one(".summary .content")
+            self.novel_synopsis = summary_div.get_text("\n\n").strip() if summary_div else ""
 
-        author_tag = soup.select_one('.novel-info .author span[itemprop="author"]')
-        self.novel_author = author_tag.text.strip() if author_tag else "Unknown"
+            self.volumes = [{"id": 1, "title": "Volume 1"}]
+            self.chapters = []
 
-        summary_div = soup.select_one(".summary .content")
-        self.novel_synopsis = summary_div.get_text("\n\n").strip() if summary_div else ""
+            self.parse_chapter_list(soup)
 
-        self.volumes = [{"id": 1, "title": "Volume 1"}]
-        self.chapters = []
-
-        # 1. Parse initial soup (Page 1) FIRST to lock the first chapters into position.
-        self.parse_chapter_list(soup)
-
-        # 2. Safely extract all other valid pages
-        pagination_links = soup.select('.pagination a[data-ajax-update="#chpagedlist"]')
-        if pagination_links:
-            common_url = self.novel_url
-            wjm = ""
-            pages_to_fetch = set()
-            
-            for link in pagination_links:
-                href = link.get("href")
-                if href and "?" in href:
-                    base, query_str = href.split("?", 1)
-                    common_url = self.absolute_url(base)
-                    query = parse_qs(query_str)
-                    if "page" in query:
-                        try:
-                            p = int(query["page"][0])
-                            if p > 1: # Skip page 1, we already have it from the initial soup
-                                pages_to_fetch.add(p)
-                        except: pass
-                    if "wjm" in query:
-                        wjm = query["wjm"][0]
-
-            if pages_to_fetch:
-                sorted_pages = sorted(list(pages_to_fetch))
-                futures = {}
+            pagination_links = soup.select('.pagination a[data-ajax-update="#chpagedlist"]')
+            if pagination_links:
+                last_page = pagination_links[-1]
+                href = last_page.get("href")
+                common_url = self.absolute_url(href).split("?")[0]
+                query = parse_qs(urlparse(href).query)
                 
-                # Submit requests asynchronously for download speed
-                for page in sorted_pages:
-                    url = f"{common_url}?page={page}&wjm={wjm}"
-                    futures[page] = self.executor.submit(self.get_soup, url)
+                page_params = query.get("page", ["0"])
+                page_count = int(page_params[0]) + 1
+                wjm = query.get("wjm", [""])[0] if "wjm" in query else ""
 
-                # BUT parse the DOM strictly sequentially (Page 2 -> 3 -> 4...)
-                for page in sorted_pages:
+                # 🚨 STRICTLY SYNCHRONOUS. NO FUTURES. NO RACE CONDITIONS. 🚨
+                for page in range(1, page_count):
                     try:
-                        page_soup = futures[page].result() # Block and wait for exact sequence
+                        url = f"{common_url}?page={page}&wjm={wjm}"
+                        page_soup = self.get_soup(url)
                         self.parse_chapter_list(page_soup)
                     except Exception as e:
-                        logger.error(f"Failed to fetch FanMTL page {page}: {e}")
+                        logger.error(f"Failed to fetch page {page}: {e}")
 
-    FanMTLCrawler.initialize = custom_fanmtl_initialize
-    FanMTLCrawler.read_novel_info = custom_fanmtl_read_novel_info
-except ImportError:
-    logger.warning("FanMTLCrawler not found. Skipping monkey-patch.")
-# ==============================================================================
+        FanMTLCrawler.read_novel_info = custom_read_novel_info
+        FanMTLCrawler._is_healer_patched = True
+    except ImportError:
+        pass
 
 def clean_text(text):
-    if text is None: return ""
+    """Aggressive normalization: Removes colons, punctuation, and non-breaking spaces."""
+    if not text: return ""
     decoded = html.unescape(str(text))
-    return " ".join(decoded.split())
+    normalized = unicodedata.normalize('NFKD', decoded)
+    alphanumeric = re.sub(r'[^a-zA-Z0-9\s]', '', normalized) # strips punctuation
+    return " ".join(alphanumeric.lower().split())
 
 def extract_url_from_epub(epub_path):
     extract_dir = epub_path + "_unzipped"
@@ -161,18 +127,12 @@ def extract_url_from_epub(epub_path):
     return match.group(1), extract_dir, None
 
 def fetch_live_toc(url):
-    """
-    Fetches TOC exactly as it appears on the source IRL.
-    ZERO mathematical sorting. ZERO guesswork.
-    """
+    apply_fanmtl_patch() # Inject into process
     app = App()
     try:
         app.user_input = url
         app.prepare_search() 
-        
-        if app.crawler:
-            app.crawler.scraper = SHARED_SESSION
-            
+        if app.crawler: app.crawler.scraper = SHARED_SESSION
         app.get_novel_info()
         
         canonical_toc = {}
@@ -183,8 +143,7 @@ def fetch_live_toc(url):
             cleaned = clean_text(chap_title)
             
             if cleaned:
-                if cleaned in canonical_toc:
-                    has_duplicates = True
+                if cleaned in canonical_toc: has_duplicates = True
                 canonical_toc[cleaned] = idx
                 
         return canonical_toc, has_duplicates, None
@@ -225,10 +184,10 @@ def fix_epub_spine(epub_path, extract_dir, canonical_toc, log_data):
             file_to_true_index[chap_file] = canonical_toc[cleaned_title]
         else:
             shutil.rmtree(extract_dir, ignore_errors=True)
-            log_data.append(f"⚠️ Exact title '{raw_title}' not found in live source TOC. Source may have changed.")
+            log_data.append(f"⚠️ Exact title '{raw_title}' not found in live source TOC.")
             return "REDOWNLOAD", None
 
-    # --- 1. REORDER OPF ---
+    # --- 1. REORDER OPF SPINE (Flat structure) ---
     opf_path = next((os.path.join(r, f) for r, _, fs in os.walk(extract_dir) for f in fs if f.endswith(".opf")), None)
     with open(opf_path, 'r', encoding='utf-8') as f:
         opf_soup = BeautifulSoup(f.read(), 'xml')
@@ -239,34 +198,24 @@ def fix_epub_spine(epub_path, extract_dir, canonical_toc, log_data):
     spine = opf_soup.find('spine')
     itemrefs = spine.find_all('itemref')
     
-    def sort_key(tag):
+    def spine_sort(tag):
         idref = tag.get('idref')
+        if not idref: return 999999
         href = id_to_href.get(idref)
         if href:
             basename = os.path.basename(href.split('#')[0])
-            if basename in file_to_true_index: 
-                return (1, file_to_true_index[basename])
-                
-        if idref and idref.startswith('volume_'): 
-            vol_num = int(re.search(r'\d+', idref).group()) if re.search(r'\d+', idref) else 0
-            return (0, vol_num)
-            
-        return (-1, 0)
+            if basename in file_to_true_index: return file_to_true_index[basename]
+        if idref.startswith('volume_'): return -1000
+        if idref in ['cover', 'intro', 'nav', 'front']: return -2000
+        return 999999
 
-    sorted_itemrefs = sorted(itemrefs, key=sort_key)
-    
-    if itemrefs == sorted_itemrefs:
-        shutil.rmtree(extract_dir, ignore_errors=True)
-        log_data.append("✅ EPUB is perfectly synced with the live source. No changes needed.")
-        return "OK", None
-
+    sorted_itemrefs = sorted(itemrefs, key=spine_sort)
     spine.clear()
     for item in sorted_itemrefs: spine.append(item)
-
     with open(opf_path, 'w', encoding='utf-8') as f:
         f.write(str(opf_soup))
 
-    # --- 2. REORDER NCX ---
+    # --- 2. REORDER NCX (Recursive to penetrate 'Volume' tags) ---
     ncx_path = next((os.path.join(r, f) for r, _, fs in os.walk(extract_dir) for f in fs if f.endswith(".ncx")), None)
     if ncx_path:
         with open(ncx_path, 'r', encoding='utf-8') as f:
@@ -274,24 +223,37 @@ def fix_epub_spine(epub_path, extract_dir, canonical_toc, log_data):
         
         navmap = ncx_soup.find('navMap')
         if navmap:
-            navpoints = navmap.find_all('navPoint', recursive=False)
-            
-            def ncx_sort(tag):
-                content = tag.find('content')
-                src = content.get('src') if content else ''
-                basename = os.path.basename(src.split('#')[0])
-                return file_to_true_index.get(basename, 999999)
+            def sort_ncx_recursive(container):
+                navpoints = container.find_all('navPoint', recursive=False)
+                if not navpoints: return
                 
-            sorted_navs = sorted(navpoints, key=ncx_sort)
-            navmap.clear()
-            for i, nav in enumerate(sorted_navs):
-                nav['playOrder'] = str(i + 1)
-                navmap.append(nav)
+                for np in navpoints:
+                    sort_ncx_recursive(np)
+                    
+                def get_idx(np):
+                    content = np.find('content')
+                    if content:
+                        src = content.get('src', '')
+                        basename = os.path.basename(src.split('#')[0])
+                        if basename in file_to_true_index: return file_to_true_index[basename]
+                        if basename.startswith('volume_'): return -1000
+                        if basename in ['cover.xhtml', 'intro.xhtml', 'nav.xhtml', 'front.xhtml']: return -2000
+                    return 999999
+                    
+                sorted_nps = sorted(navpoints, key=get_idx)
+                for np in navpoints: np.extract()
+                for np in sorted_nps: container.append(np)
+
+            sort_ncx_recursive(navmap)
+            
+            # Rewrite global playOrder explicitly
+            for i, np in enumerate(ncx_soup.find_all('navPoint')):
+                np['playOrder'] = str(i + 1)
                 
             with open(ncx_path, 'w', encoding='utf-8') as f:
                 f.write(str(ncx_soup))
 
-    # --- 3. REORDER TOC.XHTML ---
+    # --- 3. REORDER TOC.XHTML (Recursive to penetrate Lists) ---
     toc_xhtml = next((os.path.join(r, f) for r, _, fs in os.walk(extract_dir) for f in fs if f in ["toc.xhtml", "nav.xhtml"]), None)
     if toc_xhtml:
         with open(toc_xhtml, 'r', encoding='utf-8') as f:
@@ -299,19 +261,30 @@ def fix_epub_spine(epub_path, extract_dir, canonical_toc, log_data):
         
         nav_list = toc_soup.find(['ol', 'ul'])
         if nav_list:
-            items = nav_list.find_all('li', recursive=False)
+            def sort_html_recursive(container):
+                items = container.find_all('li', recursive=False)
+                if not items: return
+                
+                for li in items:
+                    child_list = li.find(['ol', 'ul'], recursive=False)
+                    if child_list: sort_html_recursive(child_list)
+                        
+                def get_idx(li):
+                    a_tag = li.find('a', recursive=False) or li.find('a')
+                    if a_tag:
+                        href = a_tag.get('href', '')
+                        basename = os.path.basename(href.split('#')[0])
+                        if basename in file_to_true_index: return file_to_true_index[basename]
+                        if basename.startswith('volume_'): return -1000
+                        if basename in ['cover.xhtml', 'intro.xhtml', 'nav.xhtml', 'front.xhtml']: return -2000
+                    return 999999
+                    
+                sorted_items = sorted(items, key=get_idx)
+                for li in items: li.extract()
+                for li in sorted_items: container.append(li)
+
+            sort_html_recursive(nav_list)
             
-            def toc_sort(tag):
-                a_tag = tag.find('a')
-                href = a_tag.get('href') if a_tag else ''
-                basename = os.path.basename(href.split('#')[0])
-                return file_to_true_index.get(basename, 999999)
-                
-            sorted_items = sorted(items, key=toc_sort)
-            nav_list.clear()
-            for item in sorted_items:
-                nav_list.append(item)
-                
             with open(toc_xhtml, 'w', encoding='utf-8') as f:
                 f.write(str(toc_soup))
         
@@ -329,10 +302,11 @@ def fix_epub_spine(epub_path, extract_dir, canonical_toc, log_data):
                 zipf.write(abs_path, os.path.relpath(abs_path, extract_dir), compress_type=zipfile.ZIP_DEFLATED)
                 
     shutil.rmtree(extract_dir, ignore_errors=True)
-    log_data.append(f"🛠️ Successfully mapped {len(epub_chapters)} chapters word-for-word. All Spines and TOCs rewritten.")
+    log_data.append(f"🛠️ Successfully mapped {len(epub_chapters)} chapters word-for-word. All Spines and TOCs deeply rewritten.")
     return "FIXED", fixed_epub_path
 
 def redownload_worker(url, out_dir):
+    apply_fanmtl_patch() # Inject into process
     load_sources()
     app = App()
     try:
