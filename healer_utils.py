@@ -184,13 +184,16 @@ def fetch_live_toc(url):
                 if cleaned in canonical_toc: has_duplicates = True
                 canonical_toc[cleaned] = idx
                 
-        # If TOC is completely empty, it usually means a 404 or blocked page
+        # STRICT 404 DETECTION
         if not canonical_toc:
-            return None, False, "TOC is empty (404 / Dead Link)"
+            return None, False, "404 Not Found"
             
         return canonical_toc, has_duplicates, None
     except Exception as e:
-        return None, False, str(e)
+        err_str = str(e)
+        if "404" in err_str:
+            return None, False, "404 Not Found"
+        return None, False, err_str
     finally:
         app.destroy()
 
@@ -202,10 +205,9 @@ def extract_title_from_html(html_path):
 
 
 # =====================================================================
-# 🚀 404 FALLBACK SORTER LOGIC 🚀
+# 🚀 STRICT 404 FALLBACK SORTER LOGIC 🚀
 # =====================================================================
 def extract_anchor_number(title):
-    """Robust regex that extracts Volume and Chapter for mathematical sorting."""
     t = str(title).lower()
     if 'prologue' in t: return (-1.0, 0.0)
     if 'epilogue' in t: return (999999.0, 0.0)
@@ -223,10 +225,9 @@ def extract_anchor_number(title):
     if len(nums) >= 2: return (float(nums[0]), float(nums[1]))
     elif len(nums) == 1: return (0.0, float(nums[0]))
         
-    return (999998.0, 0.0) # Throws unnumbered chapters to end, before epilogue
+    return (999998.0, 0.0)
 
 def fix_epub_spine_fallback(epub_path, extract_dir, log_data):
-    """Used ONLY when the source URL returns a 404. Sorts via internal math."""
     epub_chapters = [f for r, _, fs in os.walk(extract_dir) for f in fs if f.startswith("chapter_") and f.endswith(".xhtml")]
 
     chap_data = []
@@ -236,17 +237,13 @@ def fix_epub_spine_fallback(epub_path, extract_dir, log_data):
         sort_tuple = extract_anchor_number(raw_title)
         chap_data.append((chap_file, sort_tuple))
         
-    # Sort mathematically
     chap_data.sort(key=lambda x: x[1])
     file_to_true_index = {item[0]: idx for idx, item in enumerate(chap_data)}
 
     strip_watermark(extract_dir)
 
-    # 1. REORDER OPF
     opf_path = next((os.path.join(r, f) for r, _, fs in os.walk(extract_dir) for f in fs if f.endswith(".opf")), None)
-    with open(opf_path, 'r', encoding='utf-8') as f:
-        opf_soup = BeautifulSoup(f.read(), 'xml')
-        
+    with open(opf_path, 'r', encoding='utf-8') as f: opf_soup = BeautifulSoup(f.read(), 'xml')
     manifest = opf_soup.find('manifest')
     id_to_href = {item.get('id'): item.get('href') for item in manifest.find_all('item') if item.get('id')}
     spine = opf_soup.find('spine')
@@ -272,11 +269,9 @@ def fix_epub_spine_fallback(epub_path, extract_dir, log_data):
     for item in sorted_itemrefs: spine.append(item)
     with open(opf_path, 'w', encoding='utf-8') as f: f.write(str(opf_soup))
 
-    # 2. REORDER NCX
     ncx_path = next((os.path.join(r, f) for r, _, fs in os.walk(extract_dir) for f in fs if f.endswith(".ncx")), None)
     if ncx_path:
-        with open(ncx_path, 'r', encoding='utf-8') as f:
-            ncx_soup = BeautifulSoup(f.read(), 'xml')
+        with open(ncx_path, 'r', encoding='utf-8') as f: ncx_soup = BeautifulSoup(f.read(), 'xml')
         navmap = ncx_soup.find('navMap')
         if navmap:
             def sort_ncx_recursive(container):
@@ -299,11 +294,9 @@ def fix_epub_spine_fallback(epub_path, extract_dir, log_data):
             for i, np in enumerate(ncx_soup.find_all('navPoint')): np['playOrder'] = str(i + 1)
             with open(ncx_path, 'w', encoding='utf-8') as f: f.write(str(ncx_soup))
 
-    # 3. REORDER TOC.XHTML
     toc_xhtml = next((os.path.join(r, f) for r, _, fs in os.walk(extract_dir) for f in fs if f in ["toc.xhtml", "nav.xhtml"]), None)
     if toc_xhtml:
-        with open(toc_xhtml, 'r', encoding='utf-8') as f:
-            toc_soup = BeautifulSoup(f.read(), 'html.parser')
+        with open(toc_xhtml, 'r', encoding='utf-8') as f: toc_soup = BeautifulSoup(f.read(), 'html.parser')
         nav_list = toc_soup.find(['ol', 'ul'])
         if nav_list:
             def sort_html_recursive(container):
@@ -350,7 +343,6 @@ def fix_epub_spine_fallback(epub_path, extract_dir, log_data):
 
 
 def fix_epub_spine(epub_path, extract_dir, canonical_toc, log_data):
-    """STANDARD LOGIC: Uses exact 1:1 Live TOC matching."""
     epub_chapters = [f for r, _, fs in os.walk(extract_dir) for f in fs if f.startswith("chapter_") and f.endswith(".xhtml")]
 
     if len(epub_chapters) < len(canonical_toc):
@@ -381,7 +373,6 @@ def fix_epub_spine(epub_path, extract_dir, canonical_toc, log_data):
 
     strip_watermark(extract_dir)
 
-    # 1. REORDER OPF
     opf_path = next((os.path.join(r, f) for r, _, fs in os.walk(extract_dir) for f in fs if f.endswith(".opf")), None)
     with open(opf_path, 'r', encoding='utf-8') as f: opf_soup = BeautifulSoup(f.read(), 'xml')
     manifest = opf_soup.find('manifest')
@@ -409,7 +400,6 @@ def fix_epub_spine(epub_path, extract_dir, canonical_toc, log_data):
     for item in sorted_itemrefs: spine.append(item)
     with open(opf_path, 'w', encoding='utf-8') as f: f.write(str(opf_soup))
 
-    # 2. REORDER NCX
     ncx_path = next((os.path.join(r, f) for r, _, fs in os.walk(extract_dir) for f in fs if f.endswith(".ncx")), None)
     if ncx_path:
         with open(ncx_path, 'r', encoding='utf-8') as f: ncx_soup = BeautifulSoup(f.read(), 'xml')
@@ -435,7 +425,6 @@ def fix_epub_spine(epub_path, extract_dir, canonical_toc, log_data):
             for i, np in enumerate(ncx_soup.find_all('navPoint')): np['playOrder'] = str(i + 1)
             with open(ncx_path, 'w', encoding='utf-8') as f: f.write(str(ncx_soup))
 
-    # 3. REORDER TOC.XHTML
     toc_xhtml = next((os.path.join(r, f) for r, _, fs in os.walk(extract_dir) for f in fs if f in ["toc.xhtml", "nav.xhtml"]), None)
     if toc_xhtml:
         with open(toc_xhtml, 'r', encoding='utf-8') as f: toc_soup = BeautifulSoup(f.read(), 'html.parser')

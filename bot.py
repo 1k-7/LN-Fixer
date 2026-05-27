@@ -16,7 +16,6 @@ from healer_utils import extract_url_from_epub, fetch_live_toc, fix_epub_spine, 
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Config
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 API_ID = os.getenv("API_ID")
 API_HASH = os.getenv("API_HASH")
@@ -26,7 +25,6 @@ DATA_DIR = "data"
 TEMP_DIR = "temp_epubs"
 CONFIG_FILE = os.path.join(DATA_DIR, "config.json")
 
-# Force absolute paths
 ABS_TEMP_DIR = os.path.abspath(TEMP_DIR)
 os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(ABS_TEMP_DIR, exist_ok=True)
@@ -46,15 +44,12 @@ class HealerBot:
         self.userbot = None
         self.config = {}
         
-        # 🚀 VPS NETWORK TUNING (48GB RAM handles this perfectly)
         self.download_semaphore = asyncio.Semaphore(10) 
-        
-        # 🚀 VPS CPU TUNING (Force massive parallel scraping regardless of 4 physical cores)
         self.parallel_processes = 16
 
     async def post_init(self, application: Application):
         self.executor = ProcessPoolExecutor(max_workers=self.parallel_processes)
-        logger.info(f"⚙️ ProcessPoolExecutor aggressively spun up with {self.parallel_processes} parallel workers.")
+        logger.info(f"⚙️ ProcessPoolExecutor heavily scaled with {self.parallel_processes} parallel workers.")
         
         if os.path.exists(CONFIG_FILE):
             with open(CONFIG_FILE, 'r') as f:
@@ -67,10 +62,11 @@ class HealerBot:
                     api_id=int(API_ID),
                     api_hash=API_HASH,
                     session_string=SESSION_STRING,
-                    in_memory=True
+                    in_memory=True,
+                    max_concurrent_transmissions=10 # 🚀 UNLOCKS MTPROTO CONCURRENCY 🚀
                 )
                 await self.userbot.start()
-                logger.info("✅ Pyrogram Userbot Connected!")
+                logger.info("✅ Pyrogram Userbot Connected & Concurrent Transmissions Unlocked!")
             except Exception as e:
                 logger.error(f"❌ Userbot Failed: {e}")
 
@@ -82,9 +78,9 @@ class HealerBot:
 
     async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
-            "🛠 **LN EPUB Unlocked Pipeline (With 404 Math Fallback)**\n\n"
+            "🛠 **LN EPUB Unlocked Pipeline (With Active Retry & Strict 404 Fallback)**\n\n"
             "1. Send `/setup <supergroup_id>` to initialize Topics.\n"
-            "2. Send `/process <message_link>` to start parsing."
+            "2. Send `/process <message_link> [optional_start_id]` to start parsing."
         )
 
     async def cmd_setup(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -121,9 +117,18 @@ class HealerBot:
             return await update.message.reply_text("⚠️ Run `/setup` first to create the Topics.")
             
         if not context.args:
-            return await update.message.reply_text("⚠️ Provide the final message link: `/process https://t.me/c/123456789/5000`")
+            return await update.message.reply_text("⚠️ Provide the final message link: `/process https://t.me/c/123456789/5000 [optional_start_id]`")
             
         link = context.args[0]
+        start_msg_id = 1
+        
+        # 🚀 RESUME FEATURE LOGIC 🚀
+        if len(context.args) > 1:
+            try:
+                start_msg_id = int(context.args[1])
+            except ValueError:
+                return await update.message.reply_text("⚠️ Invalid start ID provided. Format: `/process <link> 2500`")
+
         try:
             parts = link.rstrip('/').split('/')
             end_msg_id = int(parts[-1])
@@ -139,17 +144,17 @@ class HealerBot:
         await update.message.reply_text(
             f"🚀 Unlocked High-Throughput Pipeline Started!\n"
             f"Source: `{source_chat}`\n"
-            f"Target ID: `1` to `{end_msg_id}`\n"
+            f"Target ID: `{start_msg_id}` to `{end_msg_id}`\n"
             f"VPS Parallelism: `{self.parallel_processes}` Processes"
         )
-        asyncio.create_task(self.run_streaming_loop(update.effective_chat.id, source_chat, end_msg_id, context.bot))
+        asyncio.create_task(self.run_streaming_loop(update.effective_chat.id, source_chat, end_msg_id, start_msg_id, context.bot))
 
-    async def status_updater(self, status_msg, stats, end_msg_id, process_q, upload_q):
+    async def status_updater(self, status_msg, stats, start_msg_id, end_msg_id, process_q, upload_q):
         while True:
             try:
                 await status_msg.edit_text(
                     f"🚀 **Pipeline Active (Decoupled & Accelerated)**\n"
-                    f"Found {stats.total_found} valid EPUBs up to ID {end_msg_id}.\n\n"
+                    f"Found {stats.total_found} valid EPUBs from ID {start_msg_id} to {end_msg_id}.\n\n"
                     f"✅ OK: {stats.success} | 🛠 Fixed: {stats.fixed}\n"
                     f"📥 Redownloaded: {stats.redownloaded} | ❌ Errors: {stats.errors}\n\n"
                     f"⚙️ Processing Queue: `{process_q.qsize()}`\n"
@@ -160,7 +165,6 @@ class HealerBot:
             await asyncio.sleep(5)
 
     async def process_single_epub(self, msg, loop):
-        """Core scraping/zipping logic"""
         log_data = []
         original_filename = msg.document.file_name
         epub_path = os.path.join(ABS_TEMP_DIR, f"{msg.id}.epub")
@@ -172,8 +176,7 @@ class HealerBot:
             async with self.download_semaphore:
                 try:
                     actual_path = await msg.download(file_name=epub_path)
-                    if actual_path:
-                        epub_path = actual_path
+                    if actual_path: epub_path = actual_path
                 except Exception as e:
                     logger.warning(f"Download attempt {attempt + 1} failed for {original_filename}: {e}")
 
@@ -184,7 +187,6 @@ class HealerBot:
                     break
                 else:
                     os.remove(epub_path)
-            
             await asyncio.sleep(2 * (attempt + 1))
             
         if not download_success:
@@ -199,46 +201,80 @@ class HealerBot:
 
         log_data.append(f"🔗 Source URL: `{url}`")
         
-        # 1. Attempt standard live TOC sync
-        canonical_toc, has_duplicates, scrape_err = await loop.run_in_executor(self.executor, fetch_live_toc, url)
+        # 🚀 ACTIVE RETRY LOOP FOR SCRAPING (Handles 502s) 🚀
+        MAX_SCRAPE_RETRIES = 3
+        canonical_toc, has_duplicates, scrape_err = None, False, None
         
-        # 2. IF 404 DEAD LINK -> Use Math Fallback
-        if scrape_err or not canonical_toc:
-            log_data.append(f"⚠️ Source URL is dead (404 Not Found). Triggering internal Math Fallback Sorter.")
-            status, result = await loop.run_in_executor(self.executor, fix_epub_spine_fallback, epub_path, extract_dir, log_data)
+        for scrape_attempt in range(MAX_SCRAPE_RETRIES):
+            canonical_toc, has_duplicates, scrape_err = await loop.run_in_executor(self.executor, fetch_live_toc, url)
+            if scrape_err and "404" not in scrape_err:
+                log_data.append(f"⚠️ Scrape attempt {scrape_attempt + 1} failed: {scrape_err}. Retrying in 3s...")
+                await asyncio.sleep(3)
+                continue
+            break # Breaks immediately if Success OR if 404 (No point retrying a dead link)
             
-        # 3. IF Live TOC Duplicate Collision -> Force Redownload
+        fallback_needed = False
+        status, result = None, None
+
+        if scrape_err:
+            if "404" in scrape_err:
+                log_data.append(f"⚠️ Source URL returned 404 Not Found. Bypassing live sync.")
+                fallback_needed = True
+            else:
+                log_data.append(f"❌ Scrape failed completely after {MAX_SCRAPE_RETRIES} attempts. Error: {scrape_err}")
+                if os.path.exists(epub_path): os.remove(epub_path)
+                shutil.rmtree(extract_dir, ignore_errors=True)
+                return "ERROR", "Scrape Failed (Server Error)", log_data
+                
         elif has_duplicates:
             log_data.append("⚠️ Canonical TOC has duplicate chapter titles. Safe sorting is impossible.")
             status = "REDOWNLOAD"
-            result = None
-            
-        # 4. Normal 1:1 Live Sync
         else:
             status, result = await loop.run_in_executor(self.executor, fix_epub_spine, epub_path, extract_dir, canonical_toc, log_data)
         
-        if status == "OK":
-            return "OK", epub_path, log_data
+        if status in ("OK", "FIXED"):
+            if os.path.exists(epub_path) and result != epub_path: os.remove(epub_path)
+            return status, result, log_data
 
-        if os.path.exists(epub_path): os.remove(epub_path)
-        
-        if status in ("REDOWNLOAD", "MISSING"):
+        # 🚀 ACTIVE RETRY LOOP FOR REDOWNLOADING (Handles 502s) 🚀
+        if status == "REDOWNLOAD":
             log_data.append("📥 Attempting fresh redownload natively (using patched sequential scraper)...")
             redownload_dir = os.path.join(ABS_TEMP_DIR, f"redownload_{msg.id}")
             os.makedirs(redownload_dir, exist_ok=True)
-            new_epub = await loop.run_in_executor(self.executor, redownload_worker, url, redownload_dir)
             
+            new_epub = None
+            for rd_attempt in range(3):
+                new_epub = await loop.run_in_executor(self.executor, redownload_worker, url, redownload_dir)
+                if new_epub: break
+                log_data.append(f"⚠️ Redownload attempt {rd_attempt + 1} failed (Likely 502/Timeout). Retrying in 5s...")
+                await asyncio.sleep(5)
+                
             if new_epub:
+                if os.path.exists(epub_path): os.remove(epub_path)
+                shutil.rmtree(extract_dir, ignore_errors=True)
                 log_data.append("✅ Redownload successful in absolute 1:1 order.")
                 return "REDOWNLOADED", new_epub, log_data
             else:
-                log_data.append("❌ Redownload failed. The live URL is completely dead or 404.")
-                return "ERROR", f"Failed to redownload {url}", log_data
+                log_data.append("❌ Redownload completely failed after 3 attempts due to server instability.")
+                if os.path.exists(epub_path): os.remove(epub_path)
+                shutil.rmtree(extract_dir, ignore_errors=True)
+                return "ERROR", "Redownload Failed (Server Error)", log_data
+
+        # 🚀 STRICT 404 MATH FALLBACK 🚀
+        if fallback_needed:
+            log_data.append("🧮 Triggering internal Math Fallback Sorter as last resort.")
+            if not os.path.exists(extract_dir):
+                _, extract_dir, _ = await loop.run_in_executor(self.executor, extract_url_from_epub, epub_path)
             
-        return status, result, log_data
+            status, result = await loop.run_in_executor(self.executor, fix_epub_spine_fallback, epub_path, extract_dir, log_data)
+            if os.path.exists(epub_path) and result != epub_path: os.remove(epub_path)
+            return status, result, log_data
+            
+        if os.path.exists(epub_path): os.remove(epub_path)
+        shutil.rmtree(extract_dir, ignore_errors=True)
+        return "ERROR", "Unhandled state reached", log_data
 
     async def process_worker(self, process_queue, upload_queue, loop):
-        """Pulls from process belt -> Fixes File -> Pushes to Upload Belt."""
         while True:
             msg = await process_queue.get()
             try:
@@ -251,7 +287,6 @@ class HealerBot:
                 process_queue.task_done()
 
     async def upload_worker(self, upload_queue, bot, target, t_ok, t_fixed, t_re, t_logs, stats):
-        """Pulls from Upload Belt -> Sends to Telegram. Blocks network, not CPU."""
         while True:
             msg, status, result, log_data = await upload_queue.get()
             try:
@@ -295,7 +330,7 @@ class HealerBot:
                 stats.processed += 1
                 upload_queue.task_done()
 
-    async def run_streaming_loop(self, chat_id, source_chat, end_msg_id, bot):
+    async def run_streaming_loop(self, chat_id, source_chat, end_msg_id, start_msg_id, bot):
         status_msg = await bot.send_message(chat_id=chat_id, text="Spinning up 3-Stage Pipeline...")
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, load_sources)
@@ -310,23 +345,20 @@ class HealerBot:
         process_queue = asyncio.Queue()
         upload_queue = asyncio.Queue()
 
-        # SPAWN MAX WORKERS (16 concurrent processes overriding physical cores)
         process_workers = [
             asyncio.create_task(self.process_worker(process_queue, upload_queue, loop))
             for _ in range(self.parallel_processes)
         ]
 
-        # NETWORK SCALING: 8 dedicated uploaders
         upload_workers = [
             asyncio.create_task(self.upload_worker(upload_queue, bot, target, t_ok, t_fixed, t_re, t_logs, stats))
             for _ in range(8)
         ]
 
-        # UI Task
-        updater_task = asyncio.create_task(self.status_updater(status_msg, stats, end_msg_id, process_queue, upload_queue))
+        updater_task = asyncio.create_task(self.status_updater(status_msg, stats, start_msg_id, end_msg_id, process_queue, upload_queue))
 
-        # PRODUCER LOOP
-        for chunk_start in range(1, end_msg_id + 1, 100):
+        # 🚀 USES THE START MESSAGE ID PARAMETER 🚀
+        for chunk_start in range(start_msg_id, end_msg_id + 1, 100):
             chunk_end = min(chunk_start + 99, end_msg_id)
             msg_ids = list(range(chunk_start, chunk_end + 1))
 
@@ -340,26 +372,22 @@ class HealerBot:
                 logger.error(f"❌ Userbot failed to fetch messages for ids {chunk_start}-{chunk_end}. Error: {e}")
                 await asyncio.sleep(5) 
 
-        # Wait for all processing to finish
         await process_queue.join()
-        
-        # Wait for all uploads to finish
         await upload_queue.join()
 
-        # Kill background tasks
         for w in process_workers: w.cancel()
         for w in upload_workers: w.cancel()
         updater_task.cancel()
 
         await status_msg.edit_text(
             f"✅ **High-Throughput Pipeline Complete!**\n\n"
-            f"Processed {stats.total_found} valid EPUBs up to ID {end_msg_id}.\n"
+            f"Processed {stats.total_found} valid EPUBs from ID {start_msg_id} to {end_msg_id}.\n"
             f"✅ OK: {stats.success} | 🛠 Fixed: {stats.fixed}\n"
             f"📥 Redownloaded: {stats.redownloaded} | ❌ Errors: {stats.errors}"
         )
 
     def start(self):
-        print("🚀 Bot Starting (Max Concurrency & 404 Fallback Unlocked)...")
+        print("🚀 Bot Starting (Max Concurrency, Active Retry & 404 Fallback Unlocked)...")
         app = Application.builder().token(TOKEN).post_init(self.post_init).post_stop(self.post_stop).build()
 
         app.add_handler(CommandHandler("start", self.cmd_start))
