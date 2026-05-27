@@ -11,7 +11,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 from pyrogram import Client as UserBotClient
 
 from lncrawl.core.sources import load_sources 
-from healer_utils import extract_url_from_epub, fetch_live_toc, fix_epub_spine, redownload_worker
+from healer_utils import extract_url_from_epub, fetch_live_toc, fix_epub_spine, fix_epub_spine_fallback, redownload_worker
 
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -45,16 +45,16 @@ class HealerBot:
         self.executor = None
         self.userbot = None
         self.config = {}
-        # Safely bumped from 2 to 4. Active retry loop protects us from MTProto drops.
-        self.download_semaphore = asyncio.Semaphore(4) 
         
-        # Detect host CPU cores to dynamically scale the heavy-lifting process pool
-        self.cpu_cores = os.cpu_count() or 4
+        # 🚀 VPS NETWORK TUNING (48GB RAM handles this perfectly)
+        self.download_semaphore = asyncio.Semaphore(10) 
+        
+        # 🚀 VPS CPU TUNING (Force massive parallel scraping regardless of 4 physical cores)
+        self.parallel_processes = 16
 
     async def post_init(self, application: Application):
-        # Dynamically scale parallel zip/scrape processing to match host hardware
-        self.executor = ProcessPoolExecutor(max_workers=self.cpu_cores)
-        logger.info(f"⚙️ ProcessPoolExecutor spun up with {self.cpu_cores} dedicated CPU cores.")
+        self.executor = ProcessPoolExecutor(max_workers=self.parallel_processes)
+        logger.info(f"⚙️ ProcessPoolExecutor aggressively spun up with {self.parallel_processes} parallel workers.")
         
         if os.path.exists(CONFIG_FILE):
             with open(CONFIG_FILE, 'r') as f:
@@ -82,7 +82,7 @@ class HealerBot:
 
     async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
-            "🛠 **LN EPUB High-Throughput Pipeline Ready**\n\n"
+            "🛠 **LN EPUB Unlocked Pipeline (With 404 Math Fallback)**\n\n"
             "1. Send `/setup <supergroup_id>` to initialize Topics.\n"
             "2. Send `/process <message_link>` to start parsing."
         )
@@ -114,7 +114,7 @@ class HealerBot:
             await status_msg.edit_text("✅ Topics created and saved successfully! Send `/process <message_link>` to begin.")
             
         except Exception as e:
-            await update.message.reply_text(f"❌ Setup Failed. Make sure the Bot (not just Userbot) is an admin. Error: {e}")
+            await update.message.reply_text(f"❌ Setup Failed. Make sure the Bot is an admin. Error: {e}")
 
     async def cmd_process(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not self.config:
@@ -136,7 +136,12 @@ class HealerBot:
         except Exception:
             return await update.message.reply_text("⚠️ Invalid message link format.")
 
-        await update.message.reply_text(f"🚀 High-Throughput Pipeline Started!\nSource: `{source_chat}`\nTarget ID: `1` to `{end_msg_id}`\nCores utilized: `{self.cpu_cores}`")
+        await update.message.reply_text(
+            f"🚀 Unlocked High-Throughput Pipeline Started!\n"
+            f"Source: `{source_chat}`\n"
+            f"Target ID: `1` to `{end_msg_id}`\n"
+            f"VPS Parallelism: `{self.parallel_processes}` Processes"
+        )
         asyncio.create_task(self.run_streaming_loop(update.effective_chat.id, source_chat, end_msg_id, context.bot))
 
     async def status_updater(self, status_msg, stats, end_msg_id, process_q, upload_q):
@@ -155,7 +160,7 @@ class HealerBot:
             await asyncio.sleep(5)
 
     async def process_single_epub(self, msg, loop):
-        """Core scraping/zipping logic (Unchanged, just runs faster natively)"""
+        """Core scraping/zipping logic"""
         log_data = []
         original_filename = msg.document.file_name
         epub_path = os.path.join(ABS_TEMP_DIR, f"{msg.id}.epub")
@@ -193,18 +198,22 @@ class HealerBot:
             return "ERROR", err, log_data
 
         log_data.append(f"🔗 Source URL: `{url}`")
+        
+        # 1. Attempt standard live TOC sync
         canonical_toc, has_duplicates, scrape_err = await loop.run_in_executor(self.executor, fetch_live_toc, url)
         
+        # 2. IF 404 DEAD LINK -> Use Math Fallback
         if scrape_err or not canonical_toc:
-            shutil.rmtree(extract_dir, ignore_errors=True)
-            if os.path.exists(epub_path): os.remove(epub_path)
-            log_data.append(f"❌ Scraping Error: {scrape_err}")
-            return "ERROR", f"Failed to scrape live TOC: {scrape_err}", log_data
-
-        if has_duplicates:
+            log_data.append(f"⚠️ Source URL is dead (404 Not Found). Triggering internal Math Fallback Sorter.")
+            status, result = await loop.run_in_executor(self.executor, fix_epub_spine_fallback, epub_path, extract_dir, log_data)
+            
+        # 3. IF Live TOC Duplicate Collision -> Force Redownload
+        elif has_duplicates:
             log_data.append("⚠️ Canonical TOC has duplicate chapter titles. Safe sorting is impossible.")
             status = "REDOWNLOAD"
             result = None
+            
+        # 4. Normal 1:1 Live Sync
         else:
             status, result = await loop.run_in_executor(self.executor, fix_epub_spine, epub_path, extract_dir, canonical_toc, log_data)
         
@@ -223,7 +232,7 @@ class HealerBot:
                 log_data.append("✅ Redownload successful in absolute 1:1 order.")
                 return "REDOWNLOADED", new_epub, log_data
             else:
-                log_data.append("❌ Redownload failed.")
+                log_data.append("❌ Redownload failed. The live URL is completely dead or 404.")
                 return "ERROR", f"Failed to redownload {url}", log_data
             
         return status, result, log_data
@@ -234,11 +243,9 @@ class HealerBot:
             msg = await process_queue.get()
             try:
                 status, result, log_data = await self.process_single_epub(msg, loop)
-                # Shove the finished file into the upload queue instantly so the CPU is freed
                 await upload_queue.put((msg, status, result, log_data))
             except Exception as e:
                 logger.error(f"Worker exception on msg {msg.id}: {e}")
-                # Log errors to be tracked by upload worker
                 await upload_queue.put((msg, "ERROR", None, [f"Fatal exception: {e}"]))
             finally:
                 process_queue.task_done()
@@ -303,17 +310,16 @@ class HealerBot:
         process_queue = asyncio.Queue()
         upload_queue = asyncio.Queue()
 
-        # DYNAMIC SCALING: Create async processor tasks = (CPU Cores * 2) 
-        # (Multiplier handles the fact that async tasks wait on network downloads heavily)
+        # SPAWN MAX WORKERS (16 concurrent processes overriding physical cores)
         process_workers = [
             asyncio.create_task(self.process_worker(process_queue, upload_queue, loop))
-            for _ in range(max(4, self.cpu_cores * 2))
+            for _ in range(self.parallel_processes)
         ]
 
-        # NETWORK SCALING: Create 3 dedicated uploaders to respect Telegram's bot API rate limits
+        # NETWORK SCALING: 8 dedicated uploaders
         upload_workers = [
             asyncio.create_task(self.upload_worker(upload_queue, bot, target, t_ok, t_fixed, t_re, t_logs, stats))
-            for _ in range(3)
+            for _ in range(8)
         ]
 
         # UI Task
@@ -353,7 +359,7 @@ class HealerBot:
         )
 
     def start(self):
-        print("🚀 Bot Starting (Decoupled 3-Stage Pipeline)...")
+        print("🚀 Bot Starting (Max Concurrency & 404 Fallback Unlocked)...")
         app = Application.builder().token(TOKEN).post_init(self.post_init).post_stop(self.post_stop).build()
 
         app.add_handler(CommandHandler("start", self.cmd_start))
